@@ -1,0 +1,19 @@
+== Media Verification (step by step) ==
+Timestamp: 2025-12-14 19:47:05
+Ambient Path: C:/Somatic Landscapes/Assets/StreamingAssets/Ambient/
+Active  Path: C:/Somatic Landscapes/Assets/StreamingAssets/Active/
+Allowed Exts: .mov
+Active Prefix: "EC" (case-insensitive)
+
+Ambient verification started...
+  - No files found.
+Active  verification started...
+  - No files found.
+
+Summary
+Ambient: 0 videos found (expected 9) - MISSING 9
+Active : 0 videos found (expected 12) - MISSING 12
+  - Ambient missing: 9
+  - Active missing: 12
+
+RESULT: OK

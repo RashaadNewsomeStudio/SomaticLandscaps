@@ -1,0 +1,110 @@
+# ======================================================
+# SOMATIC LANDSCAPES — Unity Project Git Ignore
+# ======================================================
+
+# ---------- UNITY GENERATED FOLDERS ----------
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Bb]uild/
+[Bb]uilds/
+UserSettings/
+MemoryCaptures/
+Recordings/
+
+# ---------- EXCLUDED FOLDERS ----------
+Others/
+Packages/
+
+# ---------- LOGS ----------
+Logs/**
+LogsII/**
+Logs2/**
+!Logs/.gitkeep
+
+# ---------- LOCAL BUILD FOLDER ----------
+Somatic Landscapes/**
+*_Data/
+*.exe
+
+# ---------- STREAMING ASSETS & MEDIA ----------
+Assets/Music/**
+Assets/StreamingAssets/Active/**
+Assets/StreamingAssets/Ambient/**
+
+!Assets/Music/.gitkeep
+!Assets/StreamingAssets/Active/.gitkeep
+!Assets/StreamingAssets/Ambient/.gitkeep
+
+# ---------- TEAM / USER EXCLUDED DOCS ----------
+# User requested only README.md be pushed
+SETUP_GUIDE.md
+Documentation.md
+PROJECT_OVERVIEW.md
+Somatic_Landscapes_QuickStart.md
+Fix1.md
+Solution.md
+Potential-Fixes.md
+Recomendation.md
+LASTeRRORdETECTION.MD
+
+# ---------- HELPER TOOLS (EXCLUDED) ----------
+WatchdogGUI/
+SomaticStatusServer/
+switch_cuda.bat
+convert_icon.ps1
+Web-Crash-Viewer/
+
+# ---------- LOCAL CONFIGS / SECRETS ----------
+# User requested these be ignored
+config1.json
+launcher_config.json
+Config/*.json
+*.env
+.env.*
+Secrets/**
+
+# ---------- GENERATED / SYSTEM / IDE FILES ----------
+.vs/
+.idea/
+.DS_Store
+Thumbs.db
+*.suo
+*.user
+*.userprefs
+*.csproj
+*.pidb
+*.sln
+*.sln.docstates
+*.unityproj
+bin/
+obj/
+node_modules/
+*.zip
+*.rar
+*.7z
+
+# Backup files
+*.bak
+*.backup
+
+# Recovery folders
+Assets/_Recovery/
+Assets/_Recovery.meta
+
+# ---------- MEDIA TYPES ----------
+*.mov
+*.mp4
+*.wav
+*.hap
+*.aif
+*.aiff
+
+# Root logs
+*.log
+
+# ---------- KEEP THESE IN GIT ----------
+# README.md
+# Assets/
+# Packages/
+# ProjectSettings/
