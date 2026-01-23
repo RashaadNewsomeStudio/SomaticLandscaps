@@ -4,11 +4,14 @@ using System;
 using System.IO;
 using System.Linq;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.UI;
 using TMPro;
+using SomaticLandscapes.Async;
 
 [DisallowMultipleComponent]
 public class ControllerMain : MonoBehaviour
@@ -89,6 +92,9 @@ public class ControllerMain : MonoBehaviour
     // Initialization state
     bool _initialized = false;
     readonly List<string> _earlyLog = new List<string>();
+    
+    // Async cancellation
+    private CancellationTokenSource _cancellationTokenSource;
 
     // GPU Memory Management
     float _lastMemoryCleanup = 0f;
@@ -137,69 +143,81 @@ public class ControllerMain : MonoBehaviour
 
     void Start()
     {
-        StartCoroutine(InitializeAsync());
+        _cancellationTokenSource = new CancellationTokenSource();
+        _ = InitializeAsync(_cancellationTokenSource.Token);
     }
 
-    IEnumerator InitializeAsync()
+    async Task InitializeAsync(CancellationToken ct)
     {
         Debug.Log("[ControllerMain] === Begin Safe Initialization ===");
         
-        // Paths already resolved in Awake
-        // Step 1: Load config (with fallback to defaults)
-        yield return null;
-        SafeLoadConfig();
-        
-        // Step 2: UI configuration
-        uiMaxLines = Mathf.Max(50, Config.UILogMaxLines);
-        _uiVisible = false; // Start hidden
-        toggleKey  = ParseKeyOrDefault(Config.UIToggleKey, KeyCode.F2);
-        
-        // Step 3: Initialize logging (safe, won't crash)
-        yield return null;
-        SafePrepareDirsAndLog();
-        
-        // Step 4: Flush early logs to file
-        foreach (var msg in _earlyLog)
+        try
         {
-            TryWriteFile(msg);
+            // Paths already resolved in Awake
+            // Step 1: Load config (with fallback to defaults)
+            await Task.Yield();
+            await SafeLoadConfigAsync(ct);
+            
+            // Step 2: UI configuration
+            uiMaxLines = Mathf.Max(50, Config.UILogMaxLines);
+            _uiVisible = false; // Start hidden
+            toggleKey  = ParseKeyOrDefault(Config.UIToggleKey, KeyCode.F2);
+            
+            // Step 3: Initialize logging (safe, won't crash)
+            await Task.Yield();
+            SafePrepareDirsAndLog();
+            
+            // Step 4: Flush early logs to file
+            foreach (var msg in _earlyLog)
+            {
+                TryWriteFile(msg);
+            }
+            _earlyLog.Clear();
+            
+            // Step 5: System info snapshot
+            LogInfo("=== UNITY SYSTEM INFO SNAPSHOT ===");
+            LogInfo($"Unity Version: {Application.unityVersion}");
+            LogInfo($"Platform: {Application.platform}");
+            LogInfo($"Graphics API: {SystemInfo.graphicsDeviceType}");
+            LogInfo($"GPU: {SystemInfo.graphicsDeviceName} ({SystemInfo.graphicsDeviceVendor})");
+            LogInfo($"Driver: {SystemInfo.graphicsDeviceVersion}");
+            LogInfo($"VRAM: {SystemInfo.graphicsMemorySize} MB");
+            LogInfo($"CPU: {SystemInfo.processorType} ({SystemInfo.processorCount} cores)");
+            LogInfo($"RAM: {SystemInfo.systemMemorySize} MB");
+            LogInfo($"Render Threaded: {SystemInfo.graphicsMultiThreaded}");
+            LogInfo($"OS: {SystemInfo.operatingSystem}");
+            LogInfo("===================================");
+
+            _rotateBytesThreshold = (long)Mathf.Max(0, Config.RotateBySizeMB) * 1024L * 1024L;
+            _linesSinceFlush = 0;
+
+            SafePruneOldLogs(true);
+            EnsureOverlayUI();
+            SetLogPanelVisible(false);
+
+            LogInfo("ControllerMain initialized successfully.");
+            LogInfo($"EnableThis={Config.EnableThis}, DebugMode={Config.DebugMode}");
+            LogInfo($"BaseRoot={_baseRoot}");
+            LogInfo($"ConfigDir={_configDir}");
+            LogInfo($"LogsDir={_logsDir}");
+            LogInfo($"AmbientStreamPath={Config.AmbientStreamPath}");
+            LogInfo($"ActiveStreamPath={Config.ActiveStreamPath}");
+            LogInfo($"AudioPath={Config.AudioPath}");
+            
+            if (!string.IsNullOrEmpty(Config.UIOverlayMessage))
+                LogInfo($"UIOverlayMessage=\"{Config.UIOverlayMessage}\"");
+            
+            _initialized = true;
+            Debug.Log("[ControllerMain] === Initialization Complete ===");
         }
-        _earlyLog.Clear();
-        
-        // Step 5: System info snapshot
-        LogInfo("=== UNITY SYSTEM INFO SNAPSHOT ===");
-        LogInfo($"Unity Version: {Application.unityVersion}");
-        LogInfo($"Platform: {Application.platform}");
-        LogInfo($"Graphics API: {SystemInfo.graphicsDeviceType}");
-        LogInfo($"GPU: {SystemInfo.graphicsDeviceName} ({SystemInfo.graphicsDeviceVendor})");
-        LogInfo($"Driver: {SystemInfo.graphicsDeviceVersion}");
-        LogInfo($"VRAM: {SystemInfo.graphicsMemorySize} MB");
-        LogInfo($"CPU: {SystemInfo.processorType} ({SystemInfo.processorCount} cores)");
-        LogInfo($"RAM: {SystemInfo.systemMemorySize} MB");
-        LogInfo($"Render Threaded: {SystemInfo.graphicsMultiThreaded}");
-        LogInfo($"OS: {SystemInfo.operatingSystem}");
-        LogInfo("===================================");
-
-        _rotateBytesThreshold = (long)Mathf.Max(0, Config.RotateBySizeMB) * 1024L * 1024L;
-        _linesSinceFlush = 0;
-
-        SafePruneOldLogs(true);
-        EnsureOverlayUI();
-        SetLogPanelVisible(false);
-
-        LogInfo("ControllerMain initialized successfully.");
-        LogInfo($"EnableThis={Config.EnableThis}, DebugMode={Config.DebugMode}");
-        LogInfo($"BaseRoot={_baseRoot}");
-        LogInfo($"ConfigDir={_configDir}");
-        LogInfo($"LogsDir={_logsDir}");
-        LogInfo($"AmbientStreamPath={Config.AmbientStreamPath}");
-        LogInfo($"ActiveStreamPath={Config.ActiveStreamPath}");
-        LogInfo($"AudioPath={Config.AudioPath}");
-        
-        if (!string.IsNullOrEmpty(Config.UIOverlayMessage))
-            LogInfo($"UIOverlayMessage=\"{Config.UIOverlayMessage}\"");
-        
-        _initialized = true;
-        Debug.Log("[ControllerMain] === Initialization Complete ===");
+        catch (OperationCanceledException)
+        {
+            Debug.Log("[ControllerMain] Initialization cancelled");
+        }
+        catch (Exception ex)
+        {
+            Debug.LogError($"[ControllerMain] Initialization failed: {ex.Message}\n{ex.StackTrace}");
+        }
     }
 
     void OnEnable()  => Application.logMessageReceived += OnUnityLog;
@@ -218,8 +236,20 @@ public class ControllerMain : MonoBehaviour
         }
     }
 
-    void OnApplicationQuit() => CloseLogs();
-    void OnDestroy() { if (Instance == this) Instance = null; CloseLogs(); }
+    void OnApplicationQuit()
+    {
+        _cancellationTokenSource?.Cancel();
+        _cancellationTokenSource?.Dispose();
+        CloseLogs();
+    }
+    
+    void OnDestroy()
+    {
+        if (Instance == this) Instance = null;
+        _cancellationTokenSource?.Cancel();
+        _cancellationTokenSource?.Dispose();
+        CloseLogs();
+    }
 
     // ═══════════════════════════════════════════════════════════════
     // GPU MEMORY MANAGEMENT
@@ -366,6 +396,77 @@ public class ControllerMain : MonoBehaviour
     // ═══════════════════════════════════════════════════════════════
     // SAFE CONFIG LOADING
     // ═══════════════════════════════════════════════════════════════
+
+    async Task SafeLoadConfigAsync(CancellationToken ct)
+    {
+        Debug.Log("[ControllerMain] Loading config...");
+
+        try
+        {
+            SafeCreateDir(_configDir);
+            
+            if (File.Exists(_configPath))
+            {
+                // Try to load existing config
+                for (int attempt = 0; attempt < 3; attempt++)
+                {
+                    try
+                    {
+                        // Read file asynchronously on background thread
+                        string json = await Task.Run(() => File.ReadAllText(_configPath, new UTF8Encoding(false)), ct);
+                        var loaded = JsonUtility.FromJson<ConfigData>(json);
+                        
+                        if (loaded != null)
+                        {
+                            Config = loaded;
+                            NormalizePaths(Config);
+                            Debug.Log("[ControllerMain] Config loaded successfully");
+                            return;
+                        }
+                        else
+                        {
+                            // Invalid JSON - rename and use defaults
+                            string badName = $"ControllerMain.bad_{DateTime.Now:yyyyMMdd_HHmmss}.json";
+                            File.Move(_configPath, Path.Combine(_configDir, badName));
+                            Debug.LogWarning($"[ControllerMain] Invalid config JSON, renamed to {badName}");
+                            break;
+                        }
+                    }
+                    catch (IOException) when (attempt < 2)
+                    {
+                        // File locked, retry
+                        await Task.Delay(200, ct);
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.LogWarning($"[ControllerMain] Failed to load config (attempt {attempt+1}): {ex.Message}");
+                        break;
+                    }
+                }
+            }
+
+            // Create default config
+            Config = new ConfigData();
+            NormalizePaths(Config);
+            
+            try
+            {
+                string json = JsonUtility.ToJson(Config, true);
+                await Task.Run(() => File.WriteAllText(_configPath, json, new UTF8Encoding(false)), ct);
+                Debug.Log("[ControllerMain] Created default config");
+            }
+            catch (Exception ex)
+            {
+                Debug.LogWarning($"[ControllerMain] Could not write default config: {ex.Message}");
+            }
+        }
+        catch (Exception ex)
+        {
+            Debug.LogError($"[ControllerMain] Config loading failed, using defaults: {ex.Message}");
+            Config = new ConfigData();
+            NormalizePaths(Config);
+        }
+    }
 
     void SafeLoadConfig()
     {

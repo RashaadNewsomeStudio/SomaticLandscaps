@@ -3,11 +3,14 @@ using System.Collections;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
 using UnityEngine;
 using UnityEngine.UI;
 using TMPro;
 using UnityEngine.Networking;
 using Klak.Hap;
+using SomaticLandscapes.Async;
 #if UNITY_EDITOR
 using UnityEditor;
 #endif
@@ -340,7 +343,7 @@ public class ArtworkController : MonoBehaviour
     private bool              _idlePrimedFromReturn = false, _returnStartIsA = true, _returnStartWithA = true;
     private Coroutine         _standbyDotsRoutine = null, _idleLoopRoutine, _activeRoutine;
     private Coroutine         _prepIdleACo, _prepIdleBCo, _prepActiveCo;
-    private readonly HashSet<HapPlayer> _openInFlight = new HashSet<HapPlayer>();
+    // private readonly HashSet<HapPlayer> _openInFlight = new HashSet<HapPlayer>(); // REMOVED (Legacy)
     private RenderTexture     _ownIdleA, _ownIdleB, _ownActive;
     private List<int>         _cycleIdleA = new List<int>(), _cycleIdleB = new List<int>(), _cycleIdleShared = new List<int>(), _cycleActive = new List<int>(), _cycleMusic = new List<int>();
     private HashSet<int>      _badIdleA = new HashSet<int>(), _badIdleB = new HashSet<int>(), _badIdleShared = new HashSet<int>(), _badActive = new HashSet<int>();
@@ -349,6 +352,11 @@ public class ArtworkController : MonoBehaviour
     private int _failureCountIdleA = 0, _failureCountIdleB = 0;
     private Dictionary<int, int> _quarantineIdleA = new Dictionary<int, int>(), _quarantineIdleB = new Dictionary<int, int>(), _quarantineIdleShared = new Dictionary<int, int>();
     private readonly List<AudioClip> _loadedMusic = new List<AudioClip>();
+    
+    // Async asset management
+    private AsyncAssetManager _assetManager;
+    private CancellationTokenSource _cancellationTokenSource;
+    private CancellationTokenSource _activeCTS;
 
 #if UNITY_EDITOR
     void OnValidate()
@@ -365,6 +373,16 @@ public class ArtworkController : MonoBehaviour
     // -------------------------
     void Awake()
     {
+        // Initialize async infrastructure
+        _cancellationTokenSource = new CancellationTokenSource();
+        _assetManager = AsyncAssetManager.Instance;
+        if (_assetManager == null)
+        {
+            var go = new GameObject("AsyncAssetManager");
+            _assetManager = go.AddComponent<AsyncAssetManager>();
+            DontDestroyOnLoad(go);
+        }
+        
         _controllerMain = FindFirstObjectByType<ControllerMain>();
         if (_controllerMain != null)
         {
@@ -381,7 +399,7 @@ public class ArtworkController : MonoBehaviour
         if (TryLoadArtworkConfig(out var _cfg)) ApplyArtworkConfig(_cfg);
 
         AutoPopulateFromStreamingAssets();
-        AutoDiscoverVideos();
+        // AutoDiscoverVideos(); // Moved to async Init
 
         Application.runInBackground = true;
         EnsureRTs();
@@ -392,9 +410,10 @@ public class ArtworkController : MonoBehaviour
     void Start()
     {
         EnsureMusicSourceConfigured();
-
-        if (autoLoadMusicFromStreaming)
-            StartCoroutine(LoadMusicFromConfiguredFolder());
+        InitTuningPanel();
+        
+        // Fire and forget async initialization
+        _ = InitializeAndStartAsync(_cancellationTokenSource.Token);
 
         if (activeButton)
             activeButton.onClick.AddListener(() =>
@@ -405,26 +424,34 @@ public class ArtworkController : MonoBehaviour
         if (ambientButton)
             ambientButton.onClick.AddListener(() =>
             {
-                // Respect the same non-interruptible setting for UI clicks
                 if (activeRunning && ignoreAmbientWhileActive) return;
                 if (activeRunning) SetActive(false);
             });
+    }
 
-        InitTuningPanel();
-
+    private async Task InitializeAndStartAsync(CancellationToken ct)
+    {
+        // 1. Initial cleanup
+        // Note: StopAllCoroutines() clears legacy routines, but we are moving to async tasks.
         StopAllCoroutines();
 
-        // NEW: allow skipping intro + adjust panels from config.json
+        // 2. Discover videos
+        await AutoDiscoverVideosAsync(ct);
+
+        // 3. Load music
+        if (autoLoadMusicFromStreaming)
+            await LoadMusicAsync(ct); // Need to implement this Async version or wrap existing
+
+        // 4. Startup sequence
         if (_startupPanelsEnabled)
         {
-            StartCoroutine(StartupSequenceNoMenu()); // intro → adjust → idle
+            await StartupSequenceAsync(ct);
         }
         else
         {
-            // Make sure panels are hidden if disabled
             if (introPanel)  introPanel.SetActive(false);
             if (adjustPanel) adjustPanel.SetActive(false);
-            StartCoroutine(Co_StartIdleNow());       // go directly to idle
+            await StartIdleNowAsync(ct);
         }
     }
 
@@ -436,6 +463,13 @@ public class ArtworkController : MonoBehaviour
             tuningPanel.SetActive(newState);
             if (newState) RefreshSlidersFromVars();
         }
+    }
+
+    void OnDestroy()
+    {
+        // Cancel all async operations
+        _cancellationTokenSource?.Cancel();
+        _cancellationTokenSource?.Dispose();
     }
 
     // -------------------------
@@ -586,7 +620,7 @@ public class ArtworkController : MonoBehaviour
         }
     }
 
-    private void AutoDiscoverVideos()
+    private async Task AutoDiscoverVideosAsync(CancellationToken ct)
     {
         var idleSharedList = new List<StreamingAssetRef>(idleShared ?? new StreamingAssetRef[0]);
         var activeListList = new List<StreamingAssetRef>(activeList ?? new StreamingAssetRef[0]);
@@ -594,43 +628,46 @@ public class ArtworkController : MonoBehaviour
         var existingIdle = new HashSet<string>(idleSharedList.Select(r => Path.GetFileName(GetRel(r) ?? "")), StringComparer.OrdinalIgnoreCase);
         var existingAct  = new HashSet<string>(activeListList.Select(r => Path.GetFileName(GetRel(r) ?? "")), StringComparer.OrdinalIgnoreCase);
 
+        // Ambient Discovery
         if (!string.IsNullOrEmpty(_externalAmbientPath) && Directory.Exists(_externalAmbientPath))
-            TryAppendMovsFromFolder(_externalAmbientPath, idleSharedList, existingIdle, null);
+            await TryAppendMovsFromFolderAsync(_externalAmbientPath, idleSharedList, existingIdle, null, ct);
         else
         {
             var saAmbient = Path.Combine(Application.streamingAssetsPath, "Ambient");
             if (Directory.Exists(saAmbient))
-                TryAppendMovsFromFolder(saAmbient, idleSharedList, existingIdle, "Ambient");
+                await TryAppendMovsFromFolderAsync(saAmbient, idleSharedList, existingIdle, "Ambient", ct);
         }
 
+        // Active Discovery
         if (!string.IsNullOrEmpty(_externalActivePath) && Directory.Exists(_externalActivePath))
-            TryAppendMovsFromFolder(_externalActivePath, activeListList, existingAct, null);
+            await TryAppendMovsFromFolderAsync(_externalActivePath, activeListList, existingAct, null, ct);
         else
         {
             var saActive = Path.Combine(Application.streamingAssetsPath, "Active");
             if (Directory.Exists(saActive))
-                TryAppendMovsFromFolder(saActive, activeListList, existingAct, "Active");
+                await TryAppendMovsFromFolderAsync(saActive, activeListList, existingAct, "Active", ct);
         }
 
         idleShared = idleSharedList.ToArray();
         activeList = activeListList.ToArray();
 
-        ControllerMain.LogStep($"Auto-discovered media: Idle={idleShared.Length}, Active={activeList.Length}");
+        ControllerMain.LogStep($"Auto-discovered media (Async): Idle={idleShared.Length}, Active={activeList.Length}");
     }
 
-    private void TryAppendMovsFromFolder(string folderAbs, List<StreamingAssetRef> target, HashSet<string> existingNames, string relativeBaseForSA)
+    private async Task TryAppendMovsFromFolderAsync(string folderAbs, List<StreamingAssetRef> target, HashSet<string> existingNames, string relativeBaseForSA, CancellationToken ct)
     {
         string[] files;
         try
         {
-            var f1 = Directory.GetFiles(folderAbs, "*.mov");
-            var f2 = Directory.GetFiles(folderAbs, "*.MOV");
+            // Use AsyncAssetManager for threaded discovery
+            var f1 = await _assetManager.DiscoverVideosAsync(folderAbs, "*.mov", ct);
+            var f2 = await _assetManager.DiscoverVideosAsync(folderAbs, "*.MOV", ct);
             files = f1.Concat(f2).Distinct().ToArray();
         }
         catch
         {
-            try { files = Directory.GetFiles(folderAbs, "*.mov"); }
-            catch { return; }
+            // Fallback
+             files = await _assetManager.DiscoverVideosAsync(folderAbs, "*.mov", ct);
         }
 
         foreach (var abs in files)
@@ -653,7 +690,7 @@ public class ArtworkController : MonoBehaviour
     // -------------------------
     //  Startup (no menu)
     // -------------------------
-    private IEnumerator StartupSequenceNoMenu()
+    private async Task StartupSequenceAsync(CancellationToken ct)
     {
         if (introPanel && introGroup)
         {
@@ -663,13 +700,14 @@ public class ArtworkController : MonoBehaviour
             if (introText3) introText3.gameObject.SetActive(false);
             if (introText4) introText4.gameObject.SetActive(true);
             introGroup.alpha = 0f;
-            yield return FadeOne(introGroup, 0f, 1f, introFadeIn);
-            if (introText1) { introText1.gameObject.SetActive(true); yield return WaitUnscaled(introLineStep); }
-            if (introText2) { introText2.gameObject.SetActive(true); yield return WaitUnscaled(introLineStep); }
-            if (introText3) { introText3.gameObject.SetActive(true); yield return WaitUnscaled(introLineStep); }
+            await FadeOneAsync(introGroup, 0f, 1f, introFadeIn, ct);
+            
+            if (introText1) { introText1.gameObject.SetActive(true); await AsyncExtensions.WaitForSecondsRealtime(introLineStep, ct); }
+            if (introText2) { introText2.gameObject.SetActive(true); await AsyncExtensions.WaitForSecondsRealtime(introLineStep, ct); }
+            if (introText3) { introText3.gameObject.SetActive(true); await AsyncExtensions.WaitForSecondsRealtime(introLineStep, ct); }
             if (introText4)  introText4.gameObject.SetActive(true);
-            yield return WaitUnscaled(introHold);
-            yield return FadeOne(introGroup, introGroup.alpha, 0f, introFadeOut);
+            await AsyncExtensions.WaitForSecondsRealtime(introHold, ct);
+            await FadeOneAsync(introGroup, introGroup.alpha, 0f, introFadeOut, ct);
             introPanel.SetActive(false);
         }
 
@@ -679,11 +717,13 @@ public class ArtworkController : MonoBehaviour
             adjustGroup.alpha = 0f;
             if (adjustText) adjustText.text = standbyBaseText;
             if (_standbyDotsRoutine != null) StopCoroutine(_standbyDotsRoutine);
+            // Dots animation is UI visual only, fine to be coroutine
             _standbyDotsRoutine = StartCoroutine(AnimateStandbyDots(adjustText, standbyBaseText, standbyDotStep));
+            
             var imgRt = adjustImage ? adjustImage.rectTransform : null;
             var startScale = Vector3.one * Mathf.Clamp(adjustStartScale, 0.01f, 1f);
             if (imgRt) imgRt.localScale = startScale;
-            yield return FadeOne(adjustGroup, 0f, 1f, adjustFadeIn);
+            await FadeOneAsync(adjustGroup, 0f, 1f, adjustFadeIn, ct);
 
             float t = 0f, dur = Mathf.Max(0.01f, adjustScaleDuration);
             while (t < dur)
@@ -691,17 +731,19 @@ public class ArtworkController : MonoBehaviour
                 t += Time.unscaledDeltaTime;
                 float k = Mathf.Clamp01(t / dur);
                 if (imgRt) imgRt.localScale = Vector3.LerpUnclamped(startScale, Vector3.one, k);
-                yield return null;
+                await Task.Yield();
             }
 
             if (_standbyDotsRoutine != null) { StopCoroutine(_standbyDotsRoutine); _standbyDotsRoutine = null; }
             if (adjustText) adjustText.text = standbyBaseText + "...";
-            yield return FadeOne(adjustGroup, adjustGroup.alpha, 0f, adjustFadeOut);
+            await FadeOneAsync(adjustGroup, adjustGroup.alpha, 0f, adjustFadeOut, ct);
             adjustPanel.SetActive(false);
         }
 
-        yield return Co_StartIdleNow();
+        await StartIdleNowAsync(ct);
     }
+
+
 
     private IEnumerator AnimateStandbyDots(TMP_Text label, string baseWord, float step)
     {
@@ -715,7 +757,7 @@ public class ArtworkController : MonoBehaviour
         }
     }
 
-    private IEnumerator Co_StartIdleNow()
+    private async Task StartIdleNowAsync(CancellationToken ct)
     {
         if (activeButton) activeButton.interactable = true;
 
@@ -723,37 +765,30 @@ public class ArtworkController : MonoBehaviour
         usingA = true;
 
         // CRITICAL FIX: Load videos SEQUENTIALLY to prevent VRAM exhaustion
+        
         // Load idleA first (current visible video)
-        if (_prepIdleACo != null) StopCoroutine(_prepIdleACo);
-        _prepIdleACo = StartCoroutine(TryPrepareIdleForSide(idleA, true));
-        yield return _prepIdleACo; // WAIT for idleA to finish loading
+        // Cancel any previous load tasks if they were running (though shouldn't be at start)
+        await PrepareIdleForSideAsync(idleA, true, ct);
         
-        // FIX: Yield to keep Windows responsive during heavy operations
-        yield return null;
+        // Yield to keep Windows responsive
+        await Task.Yield();
         
-        // REMOVED: GC.Collect in the middle of playback causes massive stutters.
-        // Moved to end-of-active sequences only.
-        yield return null;
-        
-        // THEN load idleB (standby video) - sequential, not parallel
-        if (_prepIdleBCo != null) StopCoroutine(_prepIdleBCo);
-        _prepIdleBCo = StartCoroutine(TryPrepareIdleForSide(idleB, false));
-        yield return _prepIdleBCo; // WAIT for idleB to finish loading
+        // THEN load idleB (standby video) - sequential
+        await PrepareIdleForSideAsync(idleB, false, ct);
 
         if (idleGA) idleGA.alpha = 1f;
         if (idleGB) idleGB.alpha = 0f;
 
-        if (_idleLoopRoutine != null) StopCoroutine(_idleLoopRoutine);
-        _idleLoopRoutine = StartCoroutine(IdleLoopSmooth());
+        // Start the async idle loop
+        _ = IdleLoopAsync(ct);
 
         ControllerMain.LogStep("Idle loop started (sequential video load complete).");
-        yield break;
     }
 
-    private IEnumerator IdleLoopSmooth()
+    private async Task IdleLoopAsync(CancellationToken ct)
     {
         if (!HasIdlePaths(true) && !HasIdlePaths(false))
-        { Debug.LogWarning("[ArtworkController] No idle files assigned."); yield break; }
+        { Debug.LogWarning("[ArtworkController] No idle files assigned."); return; }
 
         if (_idlePrimedFromReturn)
         {
@@ -767,14 +802,13 @@ public class ArtworkController : MonoBehaviour
 
         if (!crossfadeIdle)
         {
-            if (_prepIdleACo != null) StopCoroutine(_prepIdleACo);
-            _prepIdleACo = StartCoroutine(TryPrepareIdleForSide(idleA, true));
+            await PrepareIdleForSideAsync(idleA, true, ct);
             if (idleGA) idleGA.alpha = 1f;
             if (idleGB) idleGB.alpha = 0f;
-            yield break;
+            return;
         }
 
-        while (inIdle)
+        while (inIdle && !ct.IsCancellationRequested)
         {
             var active = usingA ? idleA : idleB;
             var standby = usingA ? idleB : idleA;
@@ -786,22 +820,28 @@ public class ArtworkController : MonoBehaviour
             float tPrepare   = Mathf.Max(0f, len - (targetFade + idlePrepareLead));
             float tFadeStart = Mathf.Max(0f, len - targetFade);
 
-            yield return WaitUntilHapTime(active, tPrepare);
+            // Wait until prepare time
+            try 
+            {
+                await AsyncExtensions.WaitUntil(() => active.time >= tPrepare, ct);
+            }
+            catch (OperationCanceledException) { break; }
 
-            if (usingA)
-            {
-                if (_prepIdleBCo != null) StopCoroutine(_prepIdleBCo);
-                _prepIdleBCo = StartCoroutine(TryPrepareIdleForSide(standby, false));
-            }
-            else
-            {
-                if (_prepIdleACo != null) StopCoroutine(_prepIdleACo);
-                _prepIdleACo = StartCoroutine(TryPrepareIdleForSide(standby, true));
-            }
+            // Prepare next video
+            // Fire and forget, or await? For loop timing, we trigger it here.
+            // Since we want parallel loading relative to playback, we don't await fully blocked,
+            // but AsyncAssetManager handles concurrency.
+            // We want it to start loading now.
+            _ = PrepareIdleForSideAsync(standby, !usingA, ct);
 
             if (gStd) gStd.alpha = 0f;
 
-            yield return WaitUntilHapTime(active, tFadeStart);
+            // Wait until fade start
+            try 
+            {
+                await AsyncExtensions.WaitUntil(() => active.time >= tFadeStart, ct);
+            }
+            catch (OperationCanceledException) { break; }
 
             float remaining = Mathf.Max(0.01f, len - active.time);
             float fadeDur = Mathf.Min(targetFade, remaining);
@@ -813,7 +853,7 @@ public class ArtworkController : MonoBehaviour
                 float k = Mathf.Clamp01(t / fadeDur);
                 if (gAct) gAct.alpha = Mathf.Lerp(a0, 0f, k);
                 if (gStd) gStd.alpha = Mathf.Lerp(b0, 1f, k);
-                yield return null;
+                await Task.Yield();
             }
 
             if (gAct) gAct.alpha = 0f;
@@ -836,48 +876,49 @@ public class ArtworkController : MonoBehaviour
     private void TriggerActiveSequence(string sourceTag)
     {
         _returnStartWithA = usingA;
-
-        if (_idleLoopRoutine != null) { StopCoroutine(_idleLoopRoutine); _idleLoopRoutine = null; }
-        if (_activeRoutine != null)   { StopCoroutine(_activeRoutine);   _activeRoutine = null; }
-
-        _activeRoutine = StartCoroutine(ActiveSequence());
+        
+        // Cancel existing active sequence if running
+        if (_activeCTS != null) { _activeCTS.Cancel(); _activeCTS.Dispose(); _activeCTS = null; }
+        _activeCTS = new CancellationTokenSource();
+        
+        // Link with global cancellation
+        var linked = CancellationTokenSource.CreateLinkedTokenSource(_cancellationTokenSource.Token, _activeCTS.Token);
+        
+        _ = ActiveSequenceAsync(sourceTag, linked.Token);
         ControllerMain.LogStep($"Active sequence triggered (source={sourceTag}).");
     }
 
-    private IEnumerator ActiveSequence()
+    private async Task ActiveSequenceAsync(string sourceTag, CancellationToken ct)
     {
         activeRunning = true;
         inIdle = false;
 
         // FIX 4: Stop any pending ambient prepare coroutines
-        if (_prepIdleACo != null) { StopCoroutine(_prepIdleACo); _prepIdleACo = null; }
-        if (_prepIdleBCo != null) { StopCoroutine(_prepIdleBCo); _prepIdleBCo = null; }
-
+        // (Handled by checking activeRunning in ambient loops, or cancellation)
+        
         float idleOut = Mathf.Max(0.01f, idleToActiveFadeOut);
-        yield return FadeTwo(idleGA, idleGB, 0f, 0f, idleOut);
+        await FadeTwoAsync(idleGA, idleGB, 0f, 0f, idleOut, ct);
 
         if (activeGroup) activeGroup.alpha = 0f;
 
-        bool opened = false;
-        if (_prepActiveCo != null) StopCoroutine(_prepActiveCo);
-        _prepActiveCo = StartCoroutine(TryOpenValidActive(activeHP, r => opened = r));
-        yield return _prepActiveCo;
+        // Load active video async
+        bool opened = await OpenValidActiveAsync(activeHP, ct);
 
         if (!opened)
         {
-            yield return FadeTwo(idleGA, idleGB, 1f, 0f, returnFade);
+            await FadeTwoAsync(idleGA, idleGB, 1f, 0f, returnFade, ct);
             activeRunning = false;
             inIdle = true;
-            _idleLoopRoutine = StartCoroutine(IdleLoopSmooth());
+            _ = IdleLoopAsync(ct);
             ControllerMain.LogStep("Active open failed; returning to idle.");
-            yield break;
+            return;
         }
 
         StartCoroutine(Co_StartMusicAfterDelay(musicRampIn));
 
         float fin = Mathf.Max(0.05f, activeFadeIn);
         ControllerMain.LogStep($"Active fade-in start (dur={fin:0.00}s)");
-        yield return FadeOne(activeGroup, 0f, 1f, fin);
+        await FadeOneAsync(activeGroup, 0f, 1f, fin, ct);
 
         float dur  = Mathf.Max(0.2f, (float)activeHP.streamDuration);
         float fout = Mathf.Max(0.05f, activeFadeOut);
@@ -888,14 +929,18 @@ public class ArtworkController : MonoBehaviour
 
         ControllerMain.LogStep($"Active fade-out start scheduled at t={fadeOutStart:0.00}s (dur={fout:0.00}s, total={dur:0.00}s)");
 
-        yield return WaitUntilHapTime(activeHP, fadeOutStart);
+        try
+        {
+            await AsyncExtensions.WaitUntil(() => activeHP != null && activeHP.time >= fadeOutStart, ct);
+        }
+        catch (OperationCanceledException) {}
 
         StartCoroutine(RampDownToZero(Mathf.Max(0.01f, musicRampOut)));
 
-        yield return FadeOne(activeGroup, 1f, 0f, fout);
+        await FadeOneAsync(activeGroup, 1f, 0f, fout, ct);
 
         if (!activeUseFixedWindow && activeEndHoldSeconds > 0f)
-            yield return new WaitForSeconds(activeEndHoldSeconds);
+            await AsyncExtensions.WaitForSeconds(activeEndHoldSeconds, ct);
 
         usingA = _returnStartWithA;
 
@@ -911,62 +956,56 @@ public class ArtworkController : MonoBehaviour
             }
             
             var hp = usingA ? idleA : idleB;
-            if (usingA)
-            {
-                if (_prepIdleACo != null) StopCoroutine(_prepIdleACo);
-                _prepIdleACo = StartCoroutine(TryPrepareIdleForSide(hp, true));
-                yield return _prepIdleACo; // WAIT for load to complete
-            }
-            else
-            {
-                if (_prepIdleBCo != null) StopCoroutine(_prepIdleBCo);
-                _prepIdleBCo = StartCoroutine(TryPrepareIdleForSide(hp, false));
-                yield return _prepIdleBCo; // WAIT for load to complete
-            }
+            // Load required idle side async
+            await PrepareIdleForSideAsync(hp, usingA, ct);
         }
 
-        if (returnBlackHold > 0f) yield return WaitUnscaled(returnBlackHold);
-        if (gStart) yield return FadeOne(gStart, 0f, 1f, Mathf.Max(0.05f, returnFade));
+        if (returnBlackHold > 0f) await AsyncExtensions.WaitForSecondsRealtime(returnBlackHold, ct);
+        if (gStart) await FadeOneAsync(gStart, 0f, 1f, Mathf.Max(0.05f, returnFade), ct);
 
         _returnStartIsA = usingA;
         _idlePrimedFromReturn = true;
 
         activeRunning = false;
         inIdle = true;
-        _idleLoopRoutine = StartCoroutine(IdleLoopSmooth());
+        _ = IdleLoopAsync(ct);
 
         ControllerMain.LogStep("Returned to idle.");
     }
 
+
+
     // External cancel path respecting fades
     private void StartForceReturnToIdle()
     {
-        if (_activeRoutine != null) { StopCoroutine(_activeRoutine); _activeRoutine = null; }
-        StartCoroutine(ForceReturnToIdleNow());
+        // Cancel running active sequence
+        if (_activeCTS != null) { _activeCTS.Cancel(); _activeCTS.Dispose(); _activeCTS = null; }
+        
+        _ = ForceReturnToIdleAsync(_cancellationTokenSource.Token);
     }
 
-    private IEnumerator ForceReturnToIdleNow()
+    private async Task ForceReturnToIdleAsync(CancellationToken ct)
     {
         StartCoroutine(RampDownToZero(Mathf.Max(0.01f, musicRampOut)));
 
         float fout = Mathf.Max(0.05f, activeFadeOut);
         float currentAlpha = activeGroup ? activeGroup.alpha : 0f;
 
-        if (activeGroup) yield return FadeOne(activeGroup, currentAlpha, 0f, fout);
+        if (activeGroup) await FadeOneAsync(activeGroup, currentAlpha, 0f, fout, ct);
 
         usingA = _returnStartWithA;
 
         var gStart = usingA ? idleGA : idleGB;
 
-        if (returnBlackHold > 0f) yield return WaitUnscaled(returnBlackHold);
-        if (gStart) yield return FadeOne(gStart, 0f, 1f, Mathf.Max(0.05f, returnFade));
+        if (returnBlackHold > 0f) await AsyncExtensions.WaitForSecondsRealtime(returnBlackHold, ct);
+        if (gStart) await FadeOneAsync(gStart, 0f, 1f, Mathf.Max(0.05f, returnFade), ct);
 
         _returnStartIsA = usingA;
         _idlePrimedFromReturn = true;
 
         activeRunning = false;
         inIdle = true;
-        _idleLoopRoutine = StartCoroutine(IdleLoopSmooth());
+        _ = IdleLoopAsync(ct);
 
         ControllerMain.LogStep("External cancel: returned to idle.");
     }
@@ -974,44 +1013,35 @@ public class ArtworkController : MonoBehaviour
     // -------------------------
     //  Music (Active only)
     // -------------------------
-    private IEnumerator LoadMusicFromConfiguredFolder()
+    private async Task LoadMusicAsync(CancellationToken ct)
     {
-        string dir = null;
+        string dir;
         if (!string.IsNullOrEmpty(_externalAudioPath) && Directory.Exists(_externalAudioPath))
             dir = _externalAudioPath;
         else
             dir = Path.Combine(Application.streamingAssetsPath, musicSubfolder ?? "Music");
 
-        if (!Directory.Exists(dir)) yield break;
+        if (!Directory.Exists(dir)) return;
 
         string[] files;
         try
         {
-            var f1 = Directory.GetFiles(dir, "*.wav");
-            var f2 = Directory.GetFiles(dir, "*.WAV");
+            var f1 = await Task.Run(() => Directory.GetFiles(dir, "*.wav"), ct);
+            var f2 = await Task.Run(() => Directory.GetFiles(dir, "*.WAV"), ct);
             files = f1.Concat(f2).Distinct().ToArray();
         }
-        catch { yield break; }
+        catch { return; }
 
         foreach (var file in files)
         {
-            var uri = new Uri(file).AbsoluteUri;
-            using (var req = UnityWebRequestMultimedia.GetAudioClip(uri, AudioType.WAV))
+            if (ct.IsCancellationRequested) break;
+            
+            var clip = await _assetManager.LoadAudioAsync(file, AudioType.WAV, ct);
+            if (clip != null)
             {
-                yield return req.SendWebRequest();
-#if UNITY_2020_3_OR_NEWER
-                if (req.result != UnityWebRequest.Result.Success) continue;
-#else
-                if (req.isNetworkError || req.isHttpError) continue;
-#endif
-                var clip = DownloadHandlerAudioClip.GetContent(req);
-                if (clip != null)
-                {
-                    clip.name = Path.GetFileNameWithoutExtension(file);
-                    _loadedMusic.Add(clip);
-                }
+                clip.name = Path.GetFileNameWithoutExtension(file);
+                _loadedMusic.Add(clip);
             }
-            yield return null;
         }
 
         Debug.Log($"[ArtworkController] Loaded {_loadedMusic.Count} .wav clip(s) from {dir}");
@@ -1090,186 +1120,30 @@ public class ArtworkController : MonoBehaviour
     }
 
     // -------------------------
-    //  HAP open/validate
+    //  HAP open/validate (REMOVED - Replaced by AsyncAssetManager)
     // -------------------------
-    // Guard: only one open at a time per player, prevents GPU resource conflicts
-    private IEnumerator ClaimOpen(HapPlayer hp)
-    {
-        // FIX: Add periodic yields every ~50ms to keep Windows responsive during waits
-        float nextYield = Time.unscaledTime + 0.05f;
-        while (hp != null && !_openInFlight.Add(hp))
-        {
-            yield return null;
-            
-            // Extra yield every 50ms to ensure Windows message pump stays active
-            if (Time.unscaledTime >= nextYield)
-            {
-                yield return null;
-                nextYield = Time.unscaledTime + 0.05f;
-            }
-        }
-    }
-
-    // FIX 5: Enhanced validation logging + FIX 2: Reordered Locking (Player -> Gate) to prevent Deadlocks
-    private IEnumerator OpenAndValidate(HapPlayer hp, string relativePath, Action<bool> done)
-    {
-        if (hp == null || string.IsNullOrEmpty(relativePath))
-        {
-            ControllerMain.LogWarn($"[OpenAndValidate] NULL input: hp={hp}, path='{relativePath ?? "null"}'");
-            done(false);
-            yield break;
-        }
-
-        string filename = Path.GetFileName(relativePath);
-        float startTime = Time.unscaledTime;
-
-        // LOCK 1: Claim the Player (Local Lock)
-        // Must happen BEFORE Global VRAM Lock to prevent deadlocks
-        yield return ClaimOpen(hp);
-
-        try
-        {
-            // LOCK 2: Claim VRAM Slot (Global Lock)
-            VideoMemoryFix gate = VideoMemoryFix.Instance;
-            if (gate != null)
-                yield return gate.WaitForLoadSlot();
-
-            try
-            {
-                bool success = false;
-                bool wasValid = false;
-                double finalDuration = 0;
-                bool playheadAdvanced = false;
-
-                // ----- 1. Try absolute path from ControllerMain (external folder) -----
-                bool tryAbsolute = false;
-                if (_controllerMain != null && !string.IsNullOrEmpty(filename))
-                {
-                    string baseFolder = (hp == activeHP) ? _externalActivePath : _externalAmbientPath;
-                    if (!string.IsNullOrEmpty(baseFolder))
-                    {
-                        string abs = Path.Combine(baseFolder, filename);
-                        if (File.Exists(abs))
-                        {
-                            tryAbsolute = true;
-                            ControllerMain.LogStep($"[OpenAndValidate] Opening '{filename}' (LocalFileSystem: '{abs}')");
-                            
-                            hp.time  = 0f;
-                            hp.speed = 1f;
-                            hp.loop  = false;
-                            hp.Open(abs, HapPlayer.PathMode.LocalFileSystem);
-
-                            yield return ValidateLoad(hp, startTime, filename, (ok, valid, dur, adv) => 
-                            { 
-                                success = ok; wasValid = valid; finalDuration = dur; playheadAdvanced = adv; 
-                            });
-
-                            if (success)
-                            {
-                                done(true);
-                                yield break; 
-                            }
-                        }
-                    }
-                }
-
-                if (tryAbsolute && success) yield break; // Should be handled above
-
-                // ----- 2. Fallback: StreamingAssets relative -----
-                if (!PathExistsForOpen(relativePath, pathMode))
-                {
-                    ControllerMain.LogWarn($"[OpenAndValidate] Path not found: '{relativePath}' (mode={pathMode})");
-                    done(false);
-                    yield break;
-                }
-
-                ControllerMain.LogStep($"[OpenAndValidate] Opening '{filename}' (StreamingAssets: '{relativePath}')");
-                
-                hp.time  = 0f;
-                hp.speed = 1f;
-                hp.loop  = false;
-                hp.Open(relativePath, pathMode);
-
-                yield return ValidateLoad(hp, startTime, filename, (ok, valid, dur, adv) => 
-                { 
-                    success = ok; wasValid = valid; finalDuration = dur; playheadAdvanced = adv; 
-                });
-
-                done(success);
-            }
-            finally
-            {
-                // RELEASE LOCK 2
-                if (gate != null)
-                    gate.ReleaseLoadSlot();
-            }
-        }
-        finally
-        {
-            // RELEASE LOCK 1
-            _openInFlight.Remove(hp);
-        }
-    }
-
-    private IEnumerator ValidateLoad(HapPlayer hp, float startTime, string filename, Action<bool, bool, double, bool> resultCallback)
-    {
-        bool success = false;
-        bool wasValid = false;
-        double finalDuration = 0;
-        bool playheadAdvanced = false;
-
-        float timeout = Mathf.Max(0.05f, hapOpenTimeout);
-        float t = 0f;
-        while (t < timeout)
-        {
-            t += Time.deltaTime;
-            if (hp.isValid) { wasValid = true; finalDuration = hp.streamDuration; }
-            if (hp.isValid && hp.streamDuration > 0.0) { success = true; break; }
-            yield return null;
-        }
-
-        if (success)
-        {
-            float guard = Mathf.Max(0.05f, hapPlayheadGuard);
-            double startT = hp.time;
-            float g = 0f;
-            while (g < guard)
-            {
-                g += Time.deltaTime;
-                if (hp.time - startT >= hapMinPlayheadAdvance) { playheadAdvanced = true; break; }
-                yield return null;
-            }
-        }
-
-        float elapsed = Time.unscaledTime - startTime;
-        if (success && playheadAdvanced)
-            ControllerMain.LogStep($"[OpenAndValidate] SUCCESS '{filename}' (dur={finalDuration:0.00}s, open_time={elapsed:0.00}s)");
-        else
-            ControllerMain.LogWarn($"[OpenAndValidate] FAILED/STALL '{filename}' (success={success}, valid={wasValid}, dur={finalDuration:0.00}s, flow={playheadAdvanced})");
-
-        resultCallback(success && playheadAdvanced, wasValid, finalDuration, playheadAdvanced);
-    }
-
+    // Legacy ClaimOpen, OpenAndValidate, ValidateLoad removed.
     // -------------------------
     //  Pickers / helpers
     // -------------------------
     // FIX 1: Eliminate prepare storms - retry same file with delay, quarantine after failures
-    private IEnumerator TryPrepareIdleForSide(HapPlayer hp, bool forA)
+    // FIX 1: Eliminate prepare storms - retry same file with delay, quarantine after failures
+    private async Task PrepareIdleForSideAsync(HapPlayer hp, bool forA, CancellationToken ct)
     {
         // FIX 4: Early exit if active mode is running (no ambient prepares during active)
         if (!inIdle || activeRunning)
         {
             ControllerMain.LogStep(forA ? "Idle prepare A skipped (not idle)" : "Idle prepare B skipped (not idle)");
-            yield break;
+            return;
         }
 
         // Safety guard to avoid overlapping prepares on GPU resources
-        if (forA) { if (_isPreparingA) yield break; _isPreparingA = true; }
-        else      { if (_isPreparingB) yield break; _isPreparingB = true; }
+        if (forA) { if (_isPreparingA) return; _isPreparingA = true; }
+        else      { if (_isPreparingB) return; _isPreparingB = true; }
 
         try
         {
-            if (hp == null) yield break;
+            if (hp == null) return;
 
             // FIX 1: Get or reuse last attempted index
             int attemptIdx = forA ? _lastAttemptedIdleA : _lastAttemptedIdleB;
@@ -1281,7 +1155,7 @@ public class ArtworkController : MonoBehaviour
 
             // FIX 1: Retry same file with delay if previous attempt failed
             int maxAttempts = Mathf.Max(1, hapMaxAttemptsPerPick);
-            for (int tries = 0; tries < maxAttempts; tries++)
+            for (int tries = 0; tries < maxAttempts && !ct.IsCancellationRequested; tries++)
             {
                 // Pick new file only if no previous attempt or previous succeeded
                 if (attemptIdx < 0 || failureCount >= maxAttempts)
@@ -1290,7 +1164,7 @@ public class ArtworkController : MonoBehaviour
                     if (!picked || idx < 0 || idx >= pool.Length)
                     {
                         ControllerMain.LogWarn(forA ? "Idle prepare A: No valid files" : "Idle prepare B: No valid files");
-                        yield break;
+                        return;
                     }
                     // Check quarantine
                     if (quarantine.ContainsKey(idx))
@@ -1309,23 +1183,47 @@ public class ArtworkController : MonoBehaviour
                     idx = attemptIdx;
                 }
 
-                if (idx < 0 || idx >= pool.Length) { yield break; }
+                if (idx < 0 || idx >= pool.Length) { return; }
 
                 string rel = GetRel(pool[idx]);
-                if (string.IsNullOrEmpty(rel)) { yield break; }
+                if (string.IsNullOrEmpty(rel)) { return; }
 
                 ControllerMain.LogStep($"Idle prepare {(forA ? "A" : "B")}: '{Path.GetFileName(rel)}' (attempt {tries + 1}/{maxAttempts}, failures so far={failureCount})");
 
-                bool ok = false;
-                yield return StartCoroutine(OpenAndValidate(hp, rel, r => ok = r));
+                // --- ASYNC LOAD ---
+                // Get absolute path
+                string fullPath = ResolveLoadPath(rel, false); // Helper method we need to ensure exists or logic inline
+                if (string.IsNullOrEmpty(fullPath)) 
+                { 
+                     // Try logic from OpenAndValidate
+                     string baseFolder = _externalAmbientPath;
+                     string filename = Path.GetFileName(rel);
+                     if (!string.IsNullOrEmpty(baseFolder) && !string.IsNullOrEmpty(filename))
+                     {
+                         fullPath = Path.Combine(baseFolder, filename);
+                     }
+                     else
+                     {
+                         fullPath = Path.Combine(Application.streamingAssetsPath, rel);
+                     }
+                }
 
+                bool ok = await _assetManager.LoadVideoAsync(fullPath, hp, ct);
+                
                 if (ok)
                 {
                     hp.loop = true; hp.speed = 1f; hp.time = 0f;
+                    
+                    // Assign Pooled RenderTexture
+                     var rt = _assetManager.GetOrCreateRenderTexture(_cfgW, _cfgH, forA ? "IdleA" : "IdleB");
+                     hp.targetTexture = rt;
+                     if (forA) { idleRT_A = rt; if (idleImgA) idleImgA.texture = rt; }
+                     else      { idleRT_B = rt; if (idleImgB) idleImgB.texture = rt; }
+                    
                     // Reset tracking on success
                     if (forA) { _lastAttemptedIdleA = -1; _failureCountIdleA = 0; }
                     else { _lastAttemptedIdleB = -1; _failureCountIdleB = 0; }
-                    yield break;
+                    return;
                 }
 
                 // Failed - increment failure count
@@ -1348,7 +1246,7 @@ public class ArtworkController : MonoBehaviour
 
                 // FIX 1: Delay before retry of same file
                 ControllerMain.LogWarn($"Idle prepare {(forA ? "A" : "B")}: Failed, retrying same file after {hapRetryDelay:0.00}s delay");
-                yield return new WaitForSeconds(hapRetryDelay);
+                await AsyncExtensions.WaitForSeconds(hapRetryDelay, ct);
             }
 
             ControllerMain.LogError($"Idle prepare {(forA ? "A" : "B")}: FAILED after {maxAttempts} attempts");
@@ -1359,14 +1257,24 @@ public class ArtworkController : MonoBehaviour
         }
     }
 
-    private IEnumerator TryOpenValidActive(HapPlayer hp, Action<bool> result)
+    private string ResolveLoadPath(string rel, bool isActive)
     {
-        bool success = false;
+        string filename = Path.GetFileName(rel);
+        string baseFolder = isActive ? _externalActivePath : _externalAmbientPath;
+        if (!string.IsNullOrEmpty(baseFolder) && !string.IsNullOrEmpty(filename))
+        {
+             string abs = Path.Combine(baseFolder, filename);
+             if (File.Exists(abs)) return abs;
+        }
+        return Path.Combine(Application.streamingAssetsPath, rel);
+    }
 
-        if (hp == null || activeList == null || activeList.Length == 0) { result(false); yield break; }
+    private async Task<bool> OpenValidActiveAsync(HapPlayer hp, CancellationToken ct)
+    {
+        if (hp == null || activeList == null || activeList.Length == 0) return false;
 
         int tries = 0;
-        while (tries++ < Mathf.Max(1, hapMaxAttemptsPerPick))
+        while (tries++ < Mathf.Max(1, hapMaxAttemptsPerPick) && !ct.IsCancellationRequested)
         {
             int newLast;
             int idx = NextFromCycleFiltered(_cycleActive, activeList.Length, lastActiveIndex, _badActive, out newLast);
@@ -1380,25 +1288,39 @@ public class ArtworkController : MonoBehaviour
                     string file = Path.GetFileName(rel);
                     ControllerMain.LogStep($"Active pick attempt: '{file}'");
 
-                    bool ok = false;
-                    yield return StartCoroutine(OpenAndValidate(hp, rel, r => ok = r));
+                    // Get absolute path
+                    string fullPath = ResolveLoadPath(rel, true);
+                    if (string.IsNullOrEmpty(fullPath)) 
+                    {
+                         fullPath = Path.Combine(Application.streamingAssetsPath, rel);
+                    }
+
+                    bool ok = await _assetManager.LoadVideoAsync(fullPath, hp, ct);
+                    
                     if (ok)
                     {
                         hp.loop = false; hp.speed = 1f; hp.time = 0f;
-                        ControllerMain.LogStep($"Active playing: '{file}' (dur={hp.streamDuration:0.00}s)");
-                        success = true;
-                        break;
+                        
+                        // Use pooled render texture
+                        var rt = _assetManager.GetOrCreateRenderTexture(_cfgW, _cfgH, "Active");
+                        hp.targetTexture = rt;
+                        activeRT = rt;
+                        if (activeImg) activeImg.texture = rt;
+
+                        return true;
                     }
-                    ControllerMain.LogWarn($"Active open failed: '{file}'");
+
+                    ControllerMain.LogWarn($"Active open failed: {file}");
                     _badActive.Add(idx);
                 }
             }
-            yield return null;
+            
+            await AsyncExtensions.WaitForSeconds(0.2f, ct);
         }
 
-        result(success);
+        ControllerMain.LogError("Active open GAVE UP after multiple tries.");
+        return false;
     }
-
     private bool HasIdlePaths(bool forA)
     {
         var list = forA ? idleAList : idleBList;
@@ -1558,6 +1480,21 @@ public class ArtworkController : MonoBehaviour
         g.alpha = to;
     }
 
+    private async Task FadeOneAsync(CanvasGroup g, float from, float to, float dur, CancellationToken ct)
+    {
+        if (!g) return;
+        dur = Mathf.Max(0.01f, dur);
+        float t = 0f; g.alpha = from;
+        while (t < dur)
+        {
+            t += Time.deltaTime;
+            g.alpha = Mathf.Lerp(from, to, t / dur);
+            await Task.Yield();
+            ct.ThrowIfCancellationRequested();
+        }
+        g.alpha = to;
+    }
+
     private IEnumerator FadeTwo(CanvasGroup a, CanvasGroup b, float toA, float toB, float dur)
     {
         dur = Mathf.Max(0.01f, dur);
@@ -1568,6 +1505,21 @@ public class ArtworkController : MonoBehaviour
             if (a) a.alpha = Mathf.Lerp(a0, toA, k);
             if (b) b.alpha = Mathf.Lerp(b0, toB, k);
             yield return null;
+        }
+        if (a) a.alpha = toA; if (b) b.alpha = toB;
+    }
+
+    private async Task FadeTwoAsync(CanvasGroup a, CanvasGroup b, float toA, float toB, float dur, CancellationToken ct)
+    {
+        dur = Mathf.Max(0.01f, dur);
+        float t = 0f, a0 = a ? a.alpha : 0f, b0 = b ? b.alpha : 0f;
+        while (t < dur)
+        {
+            t += Time.deltaTime; float k = Mathf.Clamp01(t / dur);
+            if (a) a.alpha = Mathf.Lerp(a0, toA, k);
+            if (b) b.alpha = Mathf.Lerp(b0, toB, k);
+            await Task.Yield();
+            ct.ThrowIfCancellationRequested();
         }
         if (a) a.alpha = toA; if (b) b.alpha = toB;
     }

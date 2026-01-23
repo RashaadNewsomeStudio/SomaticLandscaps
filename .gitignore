@@ -37,16 +37,10 @@ Assets/StreamingAssets/Ambient/**
 !Assets/StreamingAssets/Ambient/.gitkeep
 
 # ---------- TEAM / USER EXCLUDED DOCS ----------
-# User requested only README.md be pushed
-SETUP_GUIDE.md
-Documentation.md
-PROJECT_OVERVIEW.md
-Somatic_Landscapes_QuickStart.md
-Fix1.md
-Solution.md
-Potential-Fixes.md
-Recomendation.md
-LASTeRRORdETECTION.MD
+# ---------- TEAM / USER EXCLUDED DOCS ----------
+*.md
+!README.md
+INSTRUCTIONS.md
 
 # ---------- HELPER TOOLS (EXCLUDED) ----------
 WatchdogGUI/
@@ -108,3 +102,8 @@ Assets/_Recovery.meta
 # Assets/
 # Packages/
 # ProjectSettings/
+
+# ---------- MISC JUNK ----------
+.git_backup/
+Fix,md
+Textures/
