@@ -1,0 +1,419 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Net.Http;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+
+static class Program
+{
+    // ====== CONFIG ======
+    static string? gameExePath = null;
+    static string gameArgs = "";
+    static bool autoRestart = true;
+    static string apiKey = "somatic-secure-key-2026-v1"; // Fallback default for now, but should load from config
+
+    // Restart safety
+    static int initialRestartDelaySeconds = 0;
+    static int maxRestartDelaySeconds = 30;
+    static int crashWindowSeconds = 120;
+    static int maxCrashesInWindow = 5;
+
+    static string logPath = Path.Combine(AppContext.BaseDirectory, "watchdog.log");
+    static string killSwitchPath = Path.Combine(AppContext.BaseDirectory, "STOP.txt");
+    static string restartCounterPath = Path.Combine(AppContext.BaseDirectory, "restart_counter.txt");
+
+
+    // Webhook arg - (Overridden by config if present)
+    static string? webhookUrl = "https://somaticstatusserver.onrender.com/update";
+    static HttpClient? httpClient = null;
+
+    static int LoadRestartCounter()
+    {
+        try
+        {
+            if (File.Exists(restartCounterPath))
+            {
+                var content = File.ReadAllText(restartCounterPath).Trim();
+                if (int.TryParse(content, out int count))
+                    return count;
+            }
+        }
+        catch { }
+        return 0;
+    }
+
+    static void SaveRestartCounter(int count)
+    {
+        try
+        {
+            File.WriteAllText(restartCounterPath, count.ToString());
+        }
+        catch { }
+    }
+
+    // JSON Model for simple parsing
+    private class SimpleConfig
+    {
+        public string? GamePath { get; set; }
+        public string? GameArgs { get; set; }
+        public string? Webhook { get; set; }
+        public string? ApiKey { get; set; }
+    }
+
+
+    static int Main(string[] args)
+    {
+        Console.OutputEncoding = Encoding.UTF8;
+
+        // 1. Try Load Config from JSON (launcher_config.json next to exe or in parent)
+        // Check side-by-side or up one level (because WatchdogGUI puts it in its own bin)
+        
+        string configPath = "launcher_config.json";
+        if (!File.Exists(configPath))
+        {
+             // Try getting from WatchdogGUI location if we are in GameWatchdog bin
+             // But actually, WatchdogGUI writes it to ITS OWN directory.
+             // We should look in the current directory first.
+             // If launched by GUI, CWD is usually set correctly.
+        }
+
+        if (File.Exists(configPath))
+        {
+            try 
+            {
+                var json = File.ReadAllText(configPath);
+                // Simple manual parse or use System.Text.Json if available in this context
+                // Using basic string contains/split if no JSON lib, BUT we are in .NET 9 so System.Text.Json is there.
+                // NOTE: We verified imports earlier, System.Text.Json wasn't imported in Program.cs. 
+                // We will add it or do a dirty read. Let's do a dirty read for robust simplicity without adding refs if not needed.
+                // Actually, let's assume standard .NET 6+ has it.
+                
+                // Dirty Parse for ApiKey
+                if (json.Contains("\"ApiKey\""))
+                {
+                    var parts = json.Split(new[] { "\"ApiKey\"" }, StringSplitOptions.None)[1];
+                    var val = parts.Split(':')[1].Split(',')[0].Trim().Trim('"', '}', ' ', '\r', '\n');
+                    if (!string.IsNullOrWhiteSpace(val)) apiKey = val;
+                }
+                 
+                // Dirty Parse for Webhook override
+                if (json.Contains("\"Webhook\""))
+                {
+                    var parts = json.Split(new[] { "\"Webhook\"" }, StringSplitOptions.None)[1];
+                    var val = parts.Split(':')[1].Split(',')[0].Trim().Trim('"', '}', ' ', '\r', '\n');
+                    if (!string.IsNullOrWhiteSpace(val) && val.StartsWith("http")) webhookUrl = val;
+                }
+            }
+            catch {}
+        }
+
+
+        // Parse args manually to handle spaces and quotes
+        // Format expectations:
+        // 1. First arg is always game path (or we prompt)
+        // 2. Everything else is game args
+
+        var processedArgs = new List<string>();
+        for (int i = 0; i < args.Length; i++)
+        {
+             processedArgs.Add(args[i]);
+        }
+
+        // Re-assign processed args
+        if (processedArgs.Count >= 1) gameExePath = processedArgs[0].Trim('"');
+        if (processedArgs.Count >= 2) gameArgs = string.Join(" ", processedArgs.Skip(1));
+
+        if (string.IsNullOrWhiteSpace(gameExePath))
+        {
+            Console.WriteLine("Enter full path to the game .exe:");
+            gameExePath = (Console.ReadLine() ?? "").Trim().Trim('"');
+        }
+
+        if (!File.Exists(gameExePath))
+        {
+            WriteLog($"ERROR: Game exe not found: {gameExePath}");
+            Console.Error.WriteLine($"ERROR: File not found: {gameExePath}");
+            return 2;
+        }
+
+        if (!string.IsNullOrEmpty(webhookUrl))
+        {
+             httpClient = new HttpClient();
+             // ADD API KEY HEADER
+             httpClient.DefaultRequestHeaders.Add("x-api-key", apiKey);
+             
+             WriteLog($"Online logging enabled.", publicVisible: false);
+             
+             // Start Heartbeat Loop
+             Task.Run(() => HeartbeatLoop());
+        }
+
+        WriteLog($"Watchdog started. Game: {gameExePath}", publicVisible: true);
+        WriteLog($"Kill switch: Create '{killSwitchPath}' to stop watchdog gracefully.", publicVisible: false);
+
+        // Load lifetime restart counter
+        totalRestarts = LoadRestartCounter();
+        WriteLog($"Lifetime restarts: {totalRestarts}", publicVisible: false);
+
+        int restartDelay = initialRestartDelaySeconds;
+
+        while (true)
+        {
+            // Check kill switch before each restart
+            if (File.Exists(killSwitchPath))
+            {
+                WriteLog("Kill switch detected (STOP.txt). Exiting watchdog gracefully.", publicVisible: true);
+                try { File.Delete(killSwitchPath); } catch { }
+                return 0;
+            }
+
+            gameStartTime = DateTime.Now;
+            currentGameProc = StartGame(gameExePath!, gameArgs);
+
+            if (currentGameProc == null)
+            {
+                WriteLog("ERROR: Failed to start process (null). Exiting.", publicVisible: true);
+                return 3;
+            }
+
+            if (!hasAnnouncedStart)
+            {
+                WriteLog($"Game started. PID={currentGameProc.Id}", publicVisible: true);
+                hasAnnouncedStart = true;
+            }
+            else
+            {
+                totalRestarts++;
+                SaveRestartCounter(totalRestarts);
+                WriteLog($"Game refreshed ({totalRestarts}x). PID={currentGameProc.Id}", publicVisible: false);
+            }
+
+            // Wait until game exits
+            currentGameProc.WaitForExit();
+            var endTime = DateTime.Now;
+            var runtime = endTime - gameStartTime;
+
+            int exitCode = currentGameProc.ExitCode;
+            currentGameProc = null; // Clear process reference on exit
+
+            WriteLog($"Game exited. Runtime={runtime.TotalSeconds:F1}s", publicVisible: false);
+
+            // Archive Player.log BEFORE restarting (preserves crash info)
+            ArchivePlayerLog(gameExePath!);
+
+            // Decide whether to restart
+            if (!autoRestart)
+            {
+                WriteLog("Auto-restart disabled. Exiting watchdog.", publicVisible: true);
+                return 0;
+            }
+
+            // Discriminate exit codes (0 = clean exit, might not be crash)
+            bool isCrash = (exitCode != 0);
+            
+            if (isCrash)
+            {
+                WriteLog($"Detected refresh needed (exit code {exitCode}). Tracking frequency.", publicVisible: false);
+                
+                // Track crash frequency
+                crashTimes.Enqueue(endTime);
+                while (crashTimes.Count > 0 && (endTime - crashTimes.Peek()).TotalSeconds > crashWindowSeconds)
+                    crashTimes.Dequeue();
+
+                if (crashTimes.Count >= maxCrashesInWindow)
+                {
+                    WriteLog($"STOP: Too many refreshes ({crashTimes.Count}) within {crashWindowSeconds}s. Not restarting.", publicVisible: true);
+                    Console.Error.WriteLine("Stopped restarting: too many refreshes in a short time. Check logs and archived Player.log files.");
+                    return 10;
+                }
+            }
+            else
+            {
+                WriteLog("Clean exit (code 0). Will restart anyway.", publicVisible: false);
+            }
+
+            // Backoff logic: if it ran longer than 60s, reset delay (likely stable session)
+            if (runtime.TotalSeconds >= 60)
+                restartDelay = initialRestartDelaySeconds;
+            else
+                restartDelay = Math.Min(maxRestartDelaySeconds, restartDelay * 2);
+
+            WriteLog($"Restarting in {restartDelay}s... (Crashes in last {crashWindowSeconds}s: {crashTimes.Count}/{maxCrashesInWindow})", publicVisible: false);
+            Thread.Sleep(restartDelay * 1000);
+        }
+    }
+
+    // Static state for Heartbeat access
+    static Process? currentGameProc = null;
+    static DateTime gameStartTime = DateTime.MinValue;
+    static Queue<DateTime> crashTimes = new Queue<DateTime>();
+    static int totalRestarts = 0;
+
+    static async void HeartbeatLoop()
+    {
+        while (true)
+        {
+            try
+            {
+                if (httpClient != null && !string.IsNullOrEmpty(webhookUrl))
+                {
+                    // Only send JSON heartbeat if NOT Discord or Ntfy (Custom Server)
+                    // Or if we specifically decide that Ntfy doesn't get heartbeats (it would spam)
+                    // Discord also doesn't want 30s spam probably.
+                    // So we only enable heartbeat for Custom Server (detected by exclusion or explicit /update endpoint?)
+                    // For now, let's assume if it contains "/update" it's our custom server.
+                    
+                    if (webhookUrl.EndsWith("/update") || !webhookUrl.Contains("discord") && !webhookUrl.Contains("ntfy"))
+                    {
+                        var pid = currentGameProc?.Id ?? 0;
+                        var uptime = (currentGameProc != null && !currentGameProc.HasExited) 
+                                     ? (DateTime.Now - gameStartTime).TotalSeconds 
+                                     : 0;
+                        
+                        var json = $@"{{
+                            ""type"": ""heartbeat"",
+                            ""status"": ""{(pid > 0 ? "running" : "stopped")}"",
+                            ""pid"": {pid},
+                            ""uptime_seconds"": {(int)uptime},
+                            ""crashes_120s"": {crashTimes.Count},
+                            ""total_restarts"": {totalRestarts},
+                            ""timestamp"": ""{DateTime.Now:O}""
+                        }}";
+
+                        var content = new StringContent(json, Encoding.UTF8, "application/json");
+                        await httpClient.PostAsync(webhookUrl, content);
+                    }
+                }
+            }
+            catch { }
+            
+            await Task.Delay(5000); // 5 seconds freq for live updates
+        }
+    }
+
+    static Process? StartGame(string exePath, string args)
+    {
+        try
+        {
+            var psi = new ProcessStartInfo
+            {
+                FileName = exePath,
+                Arguments = args,
+                WorkingDirectory = Path.GetDirectoryName(exePath) ?? Environment.CurrentDirectory,
+                UseShellExecute = false,         // keep control
+                CreateNoWindow = true,           // watchdog stays quiet
+                RedirectStandardOutput = false,
+                RedirectStandardError = false,
+            };
+
+            return Process.Start(psi);
+        }
+        catch (Exception ex)
+        {
+            WriteLog($"ERROR: Exception starting game: {ex}");
+            return null;
+        }
+    }
+
+    static void ArchivePlayerLog(string gameExePath)
+    {
+        try
+        {
+            var gameDir = Path.GetDirectoryName(gameExePath);
+            if (string.IsNullOrEmpty(gameDir)) return;
+
+            // Unity stores Player.log in: <GameName>_Data/Player.log
+            var exeName = Path.GetFileNameWithoutExtension(gameExePath);
+            var dataFolder = Path.Combine(gameDir, $"{exeName}_Data");
+            var playerLogPath = Path.Combine(dataFolder, "Player.log");
+
+            if (!File.Exists(playerLogPath))
+            {
+                WriteLog($"Player.log not found at: {playerLogPath}");
+                return;
+            }
+
+            // Create Logs archive directory
+            var archiveDir = Path.Combine(gameDir, "Logs", "PlayerLogs");
+            Directory.CreateDirectory(archiveDir);
+
+            // Archive with timestamp
+            var timestamp = DateTime.Now.ToString("yyyy-MM-dd_HH-mm-ss");
+            var archivePath = Path.Combine(archiveDir, $"Player_{timestamp}.log");
+
+            File.Copy(playerLogPath, archivePath, overwrite: true);
+            WriteLog($"Archived Player.log → {Path.GetFileName(archivePath)}");
+
+            // Also keep a "latest" copy for quick access
+            var latestPath = Path.Combine(archiveDir, "Player_LATEST.log");
+            File.Copy(playerLogPath, latestPath, overwrite: true);
+        }
+        catch (Exception ex)
+        {
+            WriteLog($"WARNING: Failed to archive Player.log: {ex.Message}");
+        }
+    }
+
+    // Flag to track if we've announced the start once
+    static bool hasAnnouncedStart = false;
+
+    static void WriteLog(string msg, bool publicVisible = false)
+    {
+        var line = $"{DateTime.Now:yyyy-MM-dd HH:mm:ss} {msg}";
+        
+        // Always write to local file
+        try
+        {
+            File.AppendAllText(logPath, line + Environment.NewLine);
+        }
+        catch { /* ignore logging errors */ }
+
+        // Only write to Console (which GUI reads) if publicVisible is true
+        if (publicVisible)
+        {
+            Console.WriteLine(line);
+        }
+
+        // ALWAYS Send to online webhook if configured
+        if (httpClient != null && !string.IsNullOrEmpty(webhookUrl))
+        {
+            SendLogOnline(msg);
+        }
+    }
+
+    static async void SendLogOnline(string msg)
+    {
+        try
+        {
+            HttpContent content;
+
+            if (webhookUrl!.Contains("discord")) 
+            {
+                 var json = $"{{\"content\": \"**[Launcher]** {msg}\"}}";
+                 content = new StringContent(json, Encoding.UTF8, "application/json");
+                 await httpClient!.PostAsync(webhookUrl, content);
+            }
+            else if (webhookUrl.Contains("ntfy.sh"))
+            {
+                content = new StringContent($"[Somatic Launcher] {msg}");
+                using var request = new HttpRequestMessage(HttpMethod.Post, webhookUrl);
+                request.Content = content;
+                request.Headers.Add("Title", "Somatic Status");
+                request.Headers.Add("Tags", msg.Contains("STOP") || msg.Contains("ERROR") ? "warning,skull" : "white_check_mark");
+                await httpClient!.SendAsync(request);
+            }
+            else
+            {
+                // Custom Server - send to /log endpoint
+                var logUrl = webhookUrl.Replace("/update", "/log");
+                content = new StringContent(msg, Encoding.UTF8, "text/plain");
+                await httpClient!.PostAsync(logUrl, content);
+            }
+        }
+        catch { }
+    }
+}

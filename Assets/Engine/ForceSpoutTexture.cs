@@ -58,8 +58,8 @@ public class ForceSpoutTexture : MonoBehaviour
         spoutWidth = w;
         spoutHeight = h;
 
-        // 1) Create fixed-size RenderTexture for Spout (depth=0 saves VRAM, we don't need Z-buffer for video)
-        spoutRT = new RenderTexture(spoutWidth, spoutHeight, 0, RenderTextureFormat.ARGB32)
+        // 1) Create fixed-size RenderTexture for Spout (depth=24 to match RenderGraph requirements)
+        spoutRT = new RenderTexture(spoutWidth, spoutHeight, 24, RenderTextureFormat.ARGB32)
         {
             useMipMap        = false,
             autoGenerateMips = false,
@@ -71,6 +71,17 @@ public class ForceSpoutTexture : MonoBehaviour
         // 2) Render this camera into the RT and send it via Spout (Texture mode)
         cam.targetTexture    = spoutRT;
         sender.sourceTexture = spoutRT;
+
+        // PRODUCTION FIX: Make Spout camera "boring" - no post-processing, minimal features
+        // Why: URP RenderGraph + post-processing + RenderTexture output = instability
+        #if UNITY_PIPELINE_URP
+        var additionalCameraData = cam.GetUniversalAdditionalCameraData();
+        if (additionalCameraData != null)
+        {
+            additionalCameraData.renderPostProcessing = false;  // Disable all post-processing
+            additionalCameraData.antialiasing = UnityEngine.Rendering.Universal.AntialiasingMode.None;
+        }
+        #endif
 
         // 3) Make the game window fill the current monitor (any resolution)
         int sysW = Display.main.systemWidth;

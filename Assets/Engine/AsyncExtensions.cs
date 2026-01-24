@@ -18,7 +18,7 @@ namespace SomaticLandscapes.Async
             float elapsed = 0f;
             while (elapsed < seconds)
             {
-                ct.ThrowIfCancellationRequested();
+                ct.ThrowIfCancellationRequested();  // Check BEFORE accessing Time.deltaTime
                 await Task.Yield();
                 elapsed += Time.deltaTime;
             }
@@ -32,24 +32,53 @@ namespace SomaticLandscapes.Async
             float elapsed = 0f;
             while (elapsed < seconds)
             {
-                ct.ThrowIfCancellationRequested();
+                ct.ThrowIfCancellationRequested();  // Check BEFORE accessing Time.unscaledDeltaTime
                 await Task.Yield();
                 elapsed += Time.unscaledDeltaTime;
             }
         }
 
         /// <summary>
-        /// Async wait until predicate returns true
+        /// Async wait until predicate returns true (production-hardened for cancellation safety)
         /// </summary>
+        /// <remarks>
+        /// CRITICAL: Checks cancellation BEFORE evaluating predicate to prevent race conditions.
+        /// Wraps predicate in try-catch for graceful handling of null references during teardown.
+        /// </remarks>
         public static async Task WaitUntil(Func<bool> predicate, CancellationToken ct = default, int maxWaitMs = 30000)
         {
             var startTime = DateTime.UtcNow;
-            while (!predicate())
+            
+            while (true)
             {
+                // CRITICAL: Check cancellation FIRST before touching any potentially-disposed objects
                 ct.ThrowIfCancellationRequested();
                 
+                // Timeout check
                 if ((DateTime.UtcNow - startTime).TotalMilliseconds > maxWaitMs)
                     throw new TimeoutException($"WaitUntil timed out after {maxWaitMs}ms");
+                
+                // Safe predicate evaluation with defensive exception handling
+                bool predicateResult;
+                try
+                {
+                    predicateResult = predicate();
+                }
+                catch (NullReferenceException ex)
+                {
+                    // Graceful degradation: If objects are disposed during teardown, treat as false
+                    Debug.LogWarning($"[AsyncExtensions] WaitUntil predicate threw NullReferenceException (likely during cancellation): {ex.Message}");
+                    predicateResult = false;
+                }
+                catch (Exception ex)
+                {
+                    // Log and re-throw unexpected exceptions for proper error handling
+                    Debug.LogError($"[AsyncExtensions] WaitUntil predicate threw unexpected exception: {ex}");
+                    throw;
+                }
+                
+                if (predicateResult)
+                    break;
                 
                 await Task.Yield();
             }

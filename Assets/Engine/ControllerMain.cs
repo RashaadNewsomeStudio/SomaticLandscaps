@@ -238,17 +238,36 @@ public class ControllerMain : MonoBehaviour
 
     void OnApplicationQuit()
     {
-        _cancellationTokenSource?.Cancel();
-        _cancellationTokenSource?.Dispose();
+        CleanupCancellationToken();
         CloseLogs();
     }
     
     void OnDestroy()
     {
         if (Instance == this) Instance = null;
-        _cancellationTokenSource?.Cancel();
-        _cancellationTokenSource?.Dispose();
+        CleanupCancellationToken();
         CloseLogs();
+    }
+    
+    void CleanupCancellationToken()
+    {
+        if (_cancellationTokenSource != null)
+        {
+            try
+            {
+                if (!_cancellationTokenSource.IsCancellationRequested)
+                    _cancellationTokenSource.Cancel();
+            }
+            catch { /* Already disposed */ }
+            
+            try
+            {
+                _cancellationTokenSource.Dispose();
+            }
+            catch { /* Already disposed */ }
+            
+            _cancellationTokenSource = null;
+        }
     }
 
     // ═══════════════════════════════════════════════════════════════

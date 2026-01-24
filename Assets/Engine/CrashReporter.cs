@@ -46,6 +46,12 @@ public class CrashReporter : MonoBehaviour
 
     void Awake()
     {
+        // FAILSAFE: Explicitly disable CrashReporter as per request
+        Debug.Log("[CrashReporter] ⚠️ Service DISABLED by user request.");
+        enabled = false;
+        return; 
+
+        /* Unreachable code due to explicit disable above
         // Auto-fix empty inspector value to code default
         if (string.IsNullOrWhiteSpace(projectId) || projectId == "YOUR_PROJECT_ID_HERE")
         {
@@ -72,6 +78,7 @@ public class CrashReporter : MonoBehaviour
         {
             StartCoroutine(UploadPreviousLog());
         }
+        */
     }
 
     void OnDestroy()

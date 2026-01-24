@@ -84,15 +84,15 @@ This file controls the core behavior of the installation. Note that video files 
 
 ```json
 {
-  "ResolutionWidth": 5280,
-  "ResolutionHeight": 1620,
+  "ResolutionWidth": 3520,      // Optimized resolution
+  "ResolutionHeight": 1080,
 
   "IdleFadeDuration": 1.5,      // Fade time between ambient loops
   "IdlePrepareLead": 0.6,
   "IdleMinFade": 0.2,
   "CrossfadeIdle": true,
 
-  "ActiveFadeIn": 0.5,          // Fade in time for Active mode
+  "ActiveFadeIn": 2.0,          // Fade in time for Active mode
   "ActiveFadeOut": 2.0,         // Fade out time returning to Ambient
   "ActiveUseFixedWindow": true,
   "ActiveFixedMidHoldSeconds": 22.0,
@@ -110,6 +110,7 @@ This file controls the core behavior of the installation. Note that video files 
   "PanelToggleKey": 282,        // F1 Key
   "EnableStartupPanels": false
 }
+
 ```
 
 ### 2️⃣ ControllerMain.json

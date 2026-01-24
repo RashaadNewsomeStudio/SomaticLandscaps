@@ -18,9 +18,11 @@ namespace SomaticLandscapes.Async
         public static AsyncAssetManager Instance { get; private set; }
 
         [Header("Configuration")]
-        [SerializeField] private int maxConcurrentVideoLoads = 2;
+        [SerializeField] private int maxConcurrentVideoLoads = 1; // PRODUCTION FIX: One video at a time for 8K HAP stability
         [SerializeField] private float videoLoadTimeoutSeconds = 10f;
+
         [SerializeField] private int renderTexturePoolSize = 4;
+        // [SerializeField] private int renderTextureDepth = 24; // Unused, replaced by const int RequiredDepth = 24
         [SerializeField] private bool enableDebugLogs = true;
 
         // RenderTexture pool to prevent VRAM fragmentation
@@ -28,7 +30,7 @@ namespace SomaticLandscapes.Async
         private readonly HashSet<RenderTexture> _rtInUse = new HashSet<RenderTexture>();
         
         // Load queue management
-        private SemaphoreSlim _videoLoadSemaphore = new SemaphoreSlim(2, 2);
+        private SemaphoreSlim _videoLoadSemaphore = new SemaphoreSlim(1, 1);
         private readonly Dictionary<HapPlayer, CancellationTokenSource> _activeLoads = new Dictionary<HapPlayer, CancellationTokenSource>();
         
         // Cleanup tracking
@@ -46,6 +48,9 @@ namespace SomaticLandscapes.Async
             DontDestroyOnLoad(gameObject);
             
             _videoLoadSemaphore = new SemaphoreSlim(maxConcurrentVideoLoads, maxConcurrentVideoLoads);
+            
+            // CRITICAL FIX: Ensure Dispatcher exists on Main Thread before any async calls
+            var dispatcher = UnityMainThreadDispatcher.Instance;
             
             LogInfo("AsyncAssetManager initialized");
         }
@@ -106,33 +111,93 @@ namespace SomaticLandscapes.Async
 
         /// <summary>
         /// Get or create a RenderTexture from the pool
+        /// CRITICAL: Validate pooled RTs before reuse
         /// </summary>
         public RenderTexture GetOrCreateRenderTexture(int width, int height, string name = "PooledRT")
         {
-            string key = $"{width}x{height}";
+            // Standardize requirements
+            const int RequiredDepth = 24;
+            var requiredFormat = RenderTextureFormat.ARGB32;
+
+            string key = $"{width}x{height}_d{RequiredDepth}_{requiredFormat}";
             
-            if (!_rtPool.ContainsKey(key))
+            if (!_rtPool.TryGetValue(key, out var q))
+                _rtPool[key] = q = new Queue<RenderTexture>();
+
+            RenderTexture rt = null;
+
+            // CRITICAL FIX: Validate candidates from pool before reuse
+            while (q.Count > 0 && rt == null)
             {
-                _rtPool[key] = new Queue<RenderTexture>();
+                var candidate = q.Dequeue();
+
+                // Candidate might have been destroyed/released
+                if (candidate == null)
+                {
+                    LogWarning("Dequeued null RT from pool, skipping");
+                    continue;
+                }
+                
+                if (!candidate.IsCreated())
+                {
+                    LogWarning($"Dequeued RT not created (ID:{candidate.GetInstanceID()}), destroying");
+                    ScheduleDestroy(candidate);
+                    continue;
+                }
+                
+                if (candidate.depth < RequiredDepth)
+                {
+                    LogWarning($"Dequeued RT depth={candidate.depth} < {RequiredDepth} (ID:{candidate.GetInstanceID()}), destroying");
+                    ScheduleDestroy(candidate);
+                    continue;
+                }
+                
+                if (candidate.format != requiredFormat)
+                {
+                    LogWarning($"Dequeued RT format={candidate.format} != {requiredFormat} (ID:{candidate.GetInstanceID()}), destroying");
+                    ScheduleDestroy(candidate);
+                    continue;
+                }
+                
+                if (candidate.width != width || candidate.height != height)
+                {
+                    LogWarning($"Dequeued RT size={candidate.width}x{candidate.height} != {width}x{height} (ID:{candidate.GetInstanceID()}), destroying");
+                    ScheduleDestroy(candidate);
+                    continue;
+                }
+                
+                if (candidate.antiAliasing != 1)
+                {
+                    LogWarning($"Dequeued RT AA={candidate.antiAliasing} != 1 (ID:{candidate.GetInstanceID()}), destroying");
+                    ScheduleDestroy(candidate);
+                    continue;
+                }
+                
+                if (candidate.useMipMap)
+                {
+                    LogWarning($"Dequeued RT has mipmaps (ID:{candidate.GetInstanceID()}), destroying");
+                    ScheduleDestroy(candidate);
+                    continue;
+                }
+
+                // Passed all validations - use this RT
+                rt = candidate;
+                LogInfo($"Reusing validated RenderTexture: {key} (ID:{rt.GetInstanceID()}, depth:{rt.depth}, created:{rt.IsCreated()})");
             }
 
-            RenderTexture rt;
-            if (_rtPool[key].Count > 0)
+            if (rt == null)
             {
-                rt = _rtPool[key].Dequeue();
-                LogInfo($"Reusing RenderTexture from pool: {key}");
-            }
-            else
-            {
-                rt = new RenderTexture(width, height, 0, RenderTextureFormat.ARGB32)
+                // Create fresh RT
+                rt = new RenderTexture(width, height, RequiredDepth, requiredFormat)
                 {
                     name = $"{name}_{key}",
                     wrapMode = TextureWrapMode.Clamp,
                     useMipMap = false,
-                    antiAliasing = 1
+                    antiAliasing = 1,
+                    depth = RequiredDepth
                 };
                 rt.Create();
-                LogInfo($"Created new RenderTexture: {key}");
+                LogInfo($"Created new RenderTexture: {key} (ID:{rt.GetInstanceID()}, depth:{rt.depth})");
             }
 
             _rtInUse.Add(rt);
@@ -140,33 +205,72 @@ namespace SomaticLandscapes.Async
         }
 
         /// <summary>
-        /// Return a RenderTexture to the pool for reuse
-        /// </summary>
-        public void ReturnRenderTexture(RenderTexture rt)
+    /// Return a RenderTexture to the pool for reuse
+    /// CRITICAL: Only pool RTs matching pipeline requirements (depth 24, ARGB32, AA=1, no mipmaps)
+    /// </summary>
+    public void ReturnRenderTexture(RenderTexture rt)
+    {
+        if (rt == null) return;
+
+        _rtInUse.Remove(rt);
+        
+        // CRITICAL FIX: Validate RT descriptor before pooling
+        // Reject any RT that doesn't match pipeline requirements
+        if (rt.depth < 24)
         {
-            if (rt == null) return;
-
-            _rtInUse.Remove(rt);
-            string key = $"{rt.width}x{rt.height}";
-
-            if (!_rtPool.ContainsKey(key))
-            {
-                _rtPool[key] = new Queue<RenderTexture>();
-            }
-
-            // Limit pool size
-            if (_rtPool[key].Count < renderTexturePoolSize)
-            {
-                _rtPool[key].Enqueue(rt);
-                LogInfo($"Returned RenderTexture to pool: {key}");
-            }
-            else
-            {
-                // Pool full, destroy
-                ScheduleDestroy(rt);
-                LogInfo($"Pool full, destroying RenderTexture: {key}");
-            }
+            LogWarning($"Rejecting RT from pool: depth={rt.depth} < 24 (destroying instead)");
+            ScheduleDestroy(rt);
+            return;
         }
+        
+        if (rt.format != RenderTextureFormat.ARGB32)
+        {
+            LogWarning($"Rejecting RT from pool: format={rt.format} != ARGB32 (destroying instead)");
+            ScheduleDestroy(rt);
+            return;
+        }
+        
+        if (rt.antiAliasing != 1)
+        {
+            LogWarning($"Rejecting RT from pool: antiAliasing={rt.antiAliasing} != 1 (destroying instead)");
+            ScheduleDestroy(rt);
+            return;
+        }
+        
+        if (rt.useMipMap)
+        {
+            LogWarning($"Rejecting RT from pool: useMipMap=true (destroying instead)");
+            ScheduleDestroy(rt);
+            return;
+        }
+        
+        if (!rt.IsCreated())
+        {
+            LogWarning($"Rejecting RT from pool: not created (destroying instead)");
+            ScheduleDestroy(rt);
+            return;
+        }
+
+        string key = $"{rt.width}x{rt.height}_d24_ARGB32";  // Fixed descriptor key
+
+        if (!_rtPool.ContainsKey(key))
+        {
+            _rtPool[key] = new Queue<RenderTexture>();
+        }
+
+        // Limit pool size
+        if (_rtPool[key].Count < renderTexturePoolSize)
+        {
+            _rtPool[key].Enqueue(rt);
+            LogInfo($"Returned RenderTexture to pool: {key} (depth={rt.depth})");
+        }
+        else
+        {
+            // Pool full, destroy
+            ScheduleDestroy(rt);
+            LogInfo($"Pool full, destroying RenderTexture: {key}");
+        }
+    }
 
         private void ScheduleDestroy(RenderTexture rt)
         {
@@ -240,9 +344,15 @@ namespace SomaticLandscapes.Async
                         await Task.Yield();
                         
                         // Check if player is ready (on main thread)
+                        // FIX: Stronger validation (IsValid + Duration)
                         opened = await AsyncExtensions.RunOnMainThread(() => 
-                            player.streamDuration > 0.01f, cts.Token);
+                        {
+                            return player.isValid && player.streamDuration > 0.1f;
+                        }, cts.Token);
                     }
+
+                    // Extra safety: Wait for 2 frames to ensure texture is uploaded
+                    await AsyncExtensions.WaitForSecondsRealtime(0.05f, cts.Token);
 
                     if (!opened)
                     {
