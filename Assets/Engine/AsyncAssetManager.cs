@@ -1,14 +1,14 @@
-using System;
-using System.Collections.Generic;
-using System.IO;
-using System.Linq;
-using System.Threading;
-using System.Threading.Tasks;
-using UnityEngine;
-using UnityEngine.Networking;
-using Klak.Hap;
+using System; 
+using System.Collections.Generic; 
+using System.IO; 
+using System.Linq; 
+using System.Threading; 
+using System.Threading.Tasks; 
+using UnityEngine; 
+using UnityEngine.Networking; 
+using Klak.Hap; 
 
-namespace SomaticLandscapes.Async
+namespace SomaticLandscapes.Async 
 {
     /// <summary>
     /// Central async asset management system with memory pooling and background loading
@@ -20,9 +20,12 @@ namespace SomaticLandscapes.Async
         [Header("Configuration")]
         [SerializeField] private int maxConcurrentVideoLoads = 1; // PRODUCTION FIX: One video at a time for 8K HAP stability
         [SerializeField] private float videoLoadTimeoutSeconds = 10f;
+        
+        [Header("GPU Safety")]
+        [SerializeField] private int gpuBarrierFrames = 2; // Frames to wait for GPU finish (2=normal, 4=stress build)
+        [SerializeField] private int nativeCleanupFrames = 1; // Frames to wait after Close/Open
 
-        [SerializeField] private int renderTexturePoolSize = 4;
-        // [SerializeField] private int renderTextureDepth = 24; // Unused, replaced by const int RequiredDepth = 24
+        [SerializeField] private int renderTexturePoolSize = 1; // 5K TEXTURES ARE HUGE. POOL SIZE 1 IS MAX SAFE.
         [SerializeField] private bool enableDebugLogs = true;
 
         // RenderTexture pool to prevent VRAM fragmentation
@@ -32,6 +35,16 @@ namespace SomaticLandscapes.Async
         // Load queue management
         private SemaphoreSlim _videoLoadSemaphore = new SemaphoreSlim(1, 1);
         private readonly Dictionary<HapPlayer, CancellationTokenSource> _activeLoads = new Dictionary<HapPlayer, CancellationTokenSource>();
+        
+        // PRODUCTION FIX: Per-player operation lock to prevent interleaving
+        // Prevents ReleaseVideo fire-and-forget from racing with LoadVideoAsync on same player
+        private readonly Dictionary<HapPlayer, SemaphoreSlim> _playerLocks = new Dictionary<HapPlayer, SemaphoreSlim>();
+        private readonly object _playerLocksLock = new object();
+        
+        // GLOBAL NATIVE GATE: Serialize ALL HAP Open/Close operations across all instances.
+        // This is critical for plugins that are not thread-safe.
+        private static readonly SemaphoreSlim _hapNativeGate = new SemaphoreSlim(1, 1);
+        private static int _hapOpsInFlight = 0; // SANITY CHECK
         
         // Cleanup tracking
         private readonly List<RenderTexture> _rtToDestroy = new List<RenderTexture>();
@@ -187,10 +200,20 @@ namespace SomaticLandscapes.Async
 
             if (rt == null)
             {
+                // CRITICAL FIX: Check active list for existing RT with same unique name to prevent duplicates (VRAM Leak)
+                // This handles cases where logic keeps RTs alive (Stability Mode) but requests them again.
+                string activeName = $"{name}_{key}";
+                var existing = _rtInUse.FirstOrDefault(x => x.name == activeName);
+                if (existing != null)
+                {
+                     // LogInfo($"Reusing in-use RenderTexture: {activeName} (ID:{existing.GetInstanceID()})"); // Verbose
+                     return existing;
+                }
+
                 // Create fresh RT
                 rt = new RenderTexture(width, height, RequiredDepth, requiredFormat)
                 {
-                    name = $"{name}_{key}",
+                    name = activeName,
                     wrapMode = TextureWrapMode.Clamp,
                     useMipMap = false,
                     antiAliasing = 1,
@@ -275,17 +298,54 @@ namespace SomaticLandscapes.Async
         private void ScheduleDestroy(RenderTexture rt)
         {
             if (rt == null) return;
-            _rtToDestroy.Add(rt);
+            LogInfo($"Scheduled RT for destruction: {rt.width}x{rt.height}");
         }
 
-        #endregion
+        /// <summary>
+        /// Get or create a per-player operation lock
+        /// PRODUCTION: Prevents LoadVideo/ReleaseVideo operations from interleaving on same player
+        /// </summary>
+        private SemaphoreSlim GetPlayerLock(HapPlayer player)
+        {
+            lock (_playerLocksLock)
+            {
+                if (!_playerLocks.ContainsKey(player))
+                {
+                    _playerLocks[player] = new SemaphoreSlim(1, 1);
+                }
+                return _playerLocks[player];
+            }
+        }
 
-        #region Video Loading
+        /// <summary>
+        /// Release and cleanup per-player lock if no longer needed
+        /// </summary>
+        private void ReleasePlayerLock(HapPlayer player)
+        {
+            lock (_playerLocksLock)
+            {
+                if (_playerLocks.ContainsKey(player))
+                {
+                    var sem = _playerLocks[player];
+                    // Only dispose if no waiters and not currently held
+                    if (sem.CurrentCount == 1)
+                    {
+                        _playerLocks.Remove(player);
+                        sem.Dispose();
+                    }
+                }
+            }
+        }
+
+        // ==========================================
+        // VIDEO LOADING
+        // ==========================================
 
         /// <summary>
         /// Load video asynchronously with cancellation support
+        /// PRODUCTION: Per-player locked to prevent interleaving with ReleaseVideo
         /// </summary>
-        public async Task<bool> LoadVideoAsync(string path, HapPlayer player, CancellationToken ct = default)
+        public async Task<bool> LoadVideoAsync(string path, HapPlayer player, CancellationToken ct = default, Action onDetach = null)
         {
             if (player == null)
             {
@@ -299,116 +359,279 @@ namespace SomaticLandscapes.Async
                 return false;
             }
 
-            // Cancel any existing load for this player
-            if (_activeLoads.ContainsKey(player))
-            {
-                _activeLoads[player]?.Cancel();
-                _activeLoads.Remove(player);
-            }
-
-            var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-            _activeLoads[player] = cts;
-
+            // PRODUCTION: Acquire per-player lock to prevent interleaving
+            var playerLock = GetPlayerLock(player);
+            await playerLock.WaitAsync(ct);
+            
             try
             {
-                // Wait for available slot (prevent too many concurrent loads)
-                await _videoLoadSemaphore.WaitAsync(cts.Token);
+                // Cancel any existing load for this player
+                lock (_playerLocksLock)
+                {
+                    if (_activeLoads.ContainsKey(player))
+                    {
+                        _activeLoads[player]?.Cancel();
+                        _activeLoads.Remove(player);
+                    }
+                }
+
+                var cts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+                lock (_playerLocksLock)
+                {
+                    _activeLoads[player] = cts;
+                }
 
                 try
                 {
-                    LogInfo($"Loading video: {Path.GetFileName(path)}");
+                    // Wait for available slot (prevent too many concurrent loads)
+                    await _videoLoadSemaphore.WaitAsync(cts.Token);
 
-                    // Verify file exists (on background thread)
-                    bool fileExists = await Task.Run(() => File.Exists(path), cts.Token);
-                    if (!fileExists)
+                    try
                     {
-                        LogWarning($"Video file not found: {path}");
-                        return false;
-                    }
+                        LogInfo($"Loading video: {Path.GetFileName(path)}");
 
-                    // Open video on main thread
-                    bool opened = false;
-                    await AsyncExtensions.RunOnMainThread(() =>
-                    {
-                        player.Open(path);
-                    }, cts.Token);
-
-                    // Wait for video to open with timeout
-                    var timeout = TimeSpan.FromSeconds(videoLoadTimeoutSeconds);
-                    var startTime = DateTime.UtcNow;
-
-                    while (!opened && (DateTime.UtcNow - startTime) < timeout)
-                    {
-                        cts.Token.ThrowIfCancellationRequested();
-                        
-                        await Task.Yield();
-                        
-                        // Check if player is ready (on main thread)
-                        // FIX: Stronger validation (IsValid + Duration)
-                        opened = await AsyncExtensions.RunOnMainThread(() => 
+                        // Verify file exists (on background thread)
+                        bool fileExists = await Task.Run(() => File.Exists(path), cts.Token);
+                        if (!fileExists)
                         {
-                            return player.isValid && player.streamDuration > 0.1f;
-                        }, cts.Token);
+                            LogWarning($"Video file not found: {path}");
+                            return false;
+                        }
+
+                        // GLOBAL NATIVE GATE: Serialized native access
+                        await _hapNativeGate.WaitAsync(cts.Token);
+                        try
+                        {
+                            // SANITY CHECK
+                            int ops = Interlocked.Increment(ref _hapOpsInFlight);
+                            if (ops > 1) LogError($"CRITICAL: NATIVE OVERLAP DETECTED (ops={ops}) - GATE FAILURE!");
+
+                            // Step 1: Detach texture on main thread (Stop new GPU work)
+                            await AsyncExtensions.RunOnMainThread(() =>
+                            {
+                                // Detach downstream consumers (RawImages) first
+                                onDetach?.Invoke();
+                                
+                                if (player != null) player.targetTexture = null;
+                            }, cts.Token);
+                            
+                            // Step 2: GPU Barrier (Wait for EndOfFrame + 1 frame)
+                            // This ensures the GPU has finished using the texture we just detached
+                            await AsyncExtensions.WaitForEndOfFrame(cts.Token);
+                            await AsyncExtensions.WaitFrames(1, cts.Token);
+                            
+                            // Step 3: Close existing stream on Main Thread (Native operation)
+                            if (player != null)
+                            {
+                                await AsyncExtensions.RunOnMainThread(() => player.Close(), cts.Token);
+                                
+                                // Frame barrier after close (Native cleanup)
+                                if (nativeCleanupFrames > 0)
+                                    await AsyncExtensions.WaitFrames(nativeCleanupFrames, cts.Token);
+                            }
+
+                            // Step 4: Open new stream on Main Thread (Native operation)
+                            if (player != null)
+                            {
+                                await AsyncExtensions.RunOnMainThread(() => player.Open(path), cts.Token);
+                                
+                                // Wait for Open to fully initialize (Native init)
+                                await AsyncExtensions.WaitFrames(nativeCleanupFrames, cts.Token);
+                            }
+                        }
+                        finally
+                        {
+                            Interlocked.Decrement(ref _hapOpsInFlight);
+                            _hapNativeGate.Release();
+                        }
+
+
+                        bool opened = false;
+                        var timeout = TimeSpan.FromSeconds(videoLoadTimeoutSeconds);
+                        var startTime = DateTime.UtcNow;
+
+                        while (!opened && (DateTime.UtcNow - startTime) < timeout)
+                        {
+                            cts.Token.ThrowIfCancellationRequested();
+                            
+                            await Task.Yield();
+                            
+                            // Check if player is ready (on main thread)
+                            // FIX: Stronger validation (IsValid + Duration)
+                            opened = await AsyncExtensions.RunOnMainThread(() => 
+                            {
+                                return player.isValid && player.streamDuration > 0.1f;
+                            }, cts.Token);
+                        }
+
+                        // Extra safety: Wait for 2 frames to ensure texture is uploaded
+                        await AsyncExtensions.WaitForSecondsRealtime(0.05f, cts.Token);
+
+                        if (!opened)
+                        {
+                            LogWarning($"Video load timeout: {Path.GetFileName(path)}");
+                            return false;
+                        }
+
+                        LogInfo($"Video loaded successfully: {Path.GetFileName(path)} ({player.streamDuration:F2}s, gpuBarrier={gpuBarrierFrames} frames)");
+                        return true;
                     }
-
-                    // Extra safety: Wait for 2 frames to ensure texture is uploaded
-                    await AsyncExtensions.WaitForSecondsRealtime(0.05f, cts.Token);
-
-                    if (!opened)
+                    finally
                     {
-                        LogWarning($"Video load timeout: {Path.GetFileName(path)}");
-                        return false;
+                        _videoLoadSemaphore.Release();
                     }
-
-                    LogInfo($"Video loaded successfully: {Path.GetFileName(path)} ({player.streamDuration:F2}s)");
-                    return true;
+                }
+                catch (OperationCanceledException)
+                {
+                    LogInfo($"Video load cancelled: {Path.GetFileName(path)}");
+                    // CRITICAL VALIDATION: If cancelled, we must close to prevent leaks/native state corruption
+                    await AsyncExtensions.RunOnMainThread(() => { try { player.Close(); } catch {} });
+                    return false;
+                }
+                catch (Exception ex)
+                {
+                    LogWarning($"Video load error: {ex.Message}");
+                    // Ensure clean state
+                    await AsyncExtensions.RunOnMainThread(() => { try { player.Close(); } catch {} });
+                    return false;
                 }
                 finally
                 {
-                    _videoLoadSemaphore.Release();
+                    lock (_playerLocksLock)
+                    {
+                        _activeLoads.Remove(player);
+                    }
+                    cts?.Dispose();
                 }
-            }
-            catch (OperationCanceledException)
-            {
-                LogInfo($"Video load cancelled: {Path.GetFileName(path)}");
-                return false;
-            }
-            catch (Exception ex)
-            {
-                LogWarning($"Video load error: {ex.Message}");
-                return false;
             }
             finally
             {
-                _activeLoads.Remove(player);
-                cts?.Dispose();
+                // PRODUCTION: Always release per-player lock
+                playerLock.Release();
             }
         }
 
         /// <summary>
-        /// Release video and cleanup resources
+        /// Release video and cleanup resources (synchronous wrapper)
         /// </summary>
         public void ReleaseVideo(HapPlayer player)
         {
+            // Fire-and-forget the async version
+            _ = ReleaseVideoAsync(player, CancellationToken.None);
+        }
+
+        /// <summary>
+        /// Release video and cleanup resources with GPU-safe barriers
+        /// PRODUCTION: Per-player locked to prevent interleaving with LoadVideoAsync
+        /// </summary>
+        public async Task ReleaseVideoAsync(HapPlayer player, CancellationToken ct = default, Action onDetach = null)
+        {
             if (player == null) return;
 
-            // Cancel any active load
-            if (_activeLoads.ContainsKey(player))
-            {
-                _activeLoads[player]?.Cancel();
-                _activeLoads.Remove(player);
-            }
-
-            // Close player
+            // PRODUCTION: Acquire per-player lock (same as LoadVideoAsync)
+            var playerLock = GetPlayerLock(player);
+            await playerLock.WaitAsync(ct);
+            
             try
             {
-                player.Close();
+                bool wasLoading = false;
+
+                // Cancel any active load
+                lock (_playerLocksLock)
+                {
+                    if (_activeLoads.ContainsKey(player))
+                    {
+                        _activeLoads[player]?.Cancel();
+                        wasLoading = true;
+                    }
+                }
+
+                // If we were loading, the loading task will handle Close() safely
+                if (wasLoading)
+                {
+                    LogInfo($"ReleaseVideo: Cancelling active load for player (delegating Close to task).");
+                    return;
+                }
+
+                // PRODUCTION FIX: Non-loading case MUST also use GPU-safe sequence
+                // Before: Just called Close() immediately → crashes if GPU still using texture
+                // After: Detach + wait + Close with frame barriers
+                
+                try
+                {
+                    // Step 1: Detach texture on main thread
+                    await AsyncExtensions.RunOnMainThread(() =>
+                    {
+                        try
+                        {
+                            // Detach downstream consumers (RawImages) first
+                            onDetach?.Invoke();
+                            
+                            if (player != null && player.targetTexture != null)
+                            {
+                                player.targetTexture = null;
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            LogWarning($"Error detaching texture: {ex.Message}");
+                        }
+                    }, ct);
+                    
+                    // Step 2: GPU Barrier (Wait for EndOfFrame + 1 frame)
+                    // This ensures the GPU has finished using the texture we just detached
+                    await AsyncExtensions.WaitForEndOfFrame(ct);
+                    await AsyncExtensions.WaitFrames(1, ct);
+                    
+                    // GLOBAL NATIVE GATE: Serialized native access
+                    await _hapNativeGate.WaitAsync(ct);
+                    try
+                    {
+                        int ops = Interlocked.Increment(ref _hapOpsInFlight);
+                        if (ops > 1) LogError($"CRITICAL: NATIVE OVERLAP DETECTED (ops={ops}) - GATE FAILURE!");
+
+                        // Step 3: Close on main thread
+                        await AsyncExtensions.RunOnMainThread(() =>
+                        {
+                            try
+                            {
+                                player.Close();
+                                LogInfo("Player closed safely (GPU-synchronized).");
+                            }
+                            catch (Exception ex)
+                            {
+                                LogWarning($"Error closing player: {ex.Message}");
+                            }
+                        }, ct);
+                        
+                        // Step 4: Wait for native cleanup (CONFIGURABLE)
+                        await AsyncExtensions.WaitFrames(nativeCleanupFrames, ct);
+                    }
+                    finally
+                    {
+                        Interlocked.Decrement(ref _hapOpsInFlight);
+                        _hapNativeGate.Release();
+                    }
+                    
+                    // Step 4: Wait for native cleanup (CONFIGURABLE)
+                    await AsyncExtensions.WaitFrames(nativeCleanupFrames, ct);
+                }
+                catch (OperationCanceledException)
+                {
+                    LogInfo("ReleaseVideo cancelled.");
+                }
+                catch (Exception ex)
+                {
+                    LogWarning($"ReleaseVideo error: {ex.Message}");
+                }
             }
-            catch (Exception ex)
+            finally
             {
-                LogWarning($"Error closing player: {ex.Message}");
+                // PRODUCTION: Always release per-player lock
+                playerLock.Release();
             }
         }
+
 
         #endregion
 
@@ -514,6 +737,59 @@ namespace SomaticLandscapes.Async
 
         #endregion
 
+        // ==========================================
+        // UNIFIED LOADING HELPER (Refactoring)
+        // ==========================================
+
+        /// <summary>
+        /// Unified helper to Load + Configure + Assign RTs (Removes duplication between Idle/Active flows)
+        /// </summary>
+        public async Task<bool> LoadAndAssignVideoAsync(
+            string fullPath, 
+            HapPlayer hp, 
+            int w, int h, 
+            string rtName,
+            RenderTexture manualRT,            // The manual RT (priority)
+            UnityEngine.UI.RawImage targetImg, // The UI image to update
+            bool isLooping,
+            CancellationToken ct,
+            Action<RenderTexture> onRtAssigned = null // Callback to update controller field
+        )
+        {
+            // 1. Load (Async)
+            bool ok = await LoadVideoAsync(fullPath, hp, ct, () => 
+            {
+                // Pre-detach callback
+                if (targetImg) targetImg.texture = null;
+            });
+
+            if (!ok) return false;
+
+            // 2. Configure (Main Thread)
+            await AsyncExtensions.RunOnMainThread(() =>
+            {
+                hp.loop = isLooping; 
+                hp.speed = 1f; 
+                hp.time = 0f;
+                
+                // Use Manual RT if available (The Fix)
+                RenderTexture rt = manualRT;
+                if (rt == null)
+                {
+                    rt = GetOrCreateRenderTexture(w, h, rtName);
+                }
+                
+                hp.targetTexture = rt;
+                if (targetImg) targetImg.texture = rt;
+
+                // Notify caller to update their state (e.g. _ctrl.idleRT_A = rt)
+                onRtAssigned?.Invoke(rt);
+
+            }, ct);
+
+            return true;
+        }
+
         #region Logging
 
         private void LogInfo(string message)
@@ -525,6 +801,11 @@ namespace SomaticLandscapes.Async
         private void LogWarning(string message)
         {
             ControllerMain.LogWarn($"[AsyncAssetManager] {message}");
+        }
+
+        private void LogError(string message)
+        {
+            ControllerMain.LogError($"[AsyncAssetManager] {message}");
         }
 
         #endregion

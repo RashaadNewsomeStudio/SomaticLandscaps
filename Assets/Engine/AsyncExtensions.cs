@@ -85,6 +85,32 @@ namespace SomaticLandscapes.Async
         }
 
         /// <summary>
+        /// Wait for specified number of Unity frames (provides GPU synchronization barrier)
+        /// CRITICAL for HAP player lifecycle: ensures GPU finishes processing textures
+        /// PRODUCTION FIX: Uses frameCount instead of float equality for reliability
+        /// </summary>
+        public static async Task WaitFrames(int frameCount, CancellationToken ct = default)
+        {
+            int startFrame = Time.frameCount;
+            int targetFrame = startFrame + frameCount;
+            
+            while (Time.frameCount < targetFrame)
+            {
+                ct.ThrowIfCancellationRequested();
+                await Task.Yield();
+            }
+            
+            // Diagnostic: Log if requested (helps validate frame barriers working)
+            #if UNITY_EDITOR || DEVELOPMENT_BUILD
+            int actualFrames = Time.frameCount - startFrame;
+            if (actualFrames != frameCount)
+            {
+                Debug.LogWarning($"[AsyncExtensions] WaitFrames requested {frameCount}, got {actualFrames} frames");
+            }
+            #endif
+        }
+
+        /// <summary>
         /// Async wait while predicate returns true
         /// </summary>
         public static async Task WaitWhile(Func<bool> predicate, CancellationToken ct = default, int maxWaitMs = 30000)
@@ -153,5 +179,36 @@ namespace SomaticLandscapes.Async
             await tcs.Task;
             return tcs.Task.Result;
         }
+        /// <summary>
+        /// Async wait for EndOfFrame (requires Main Thread Dispatcher)
+        /// CRITICAL: Ensures GPU has finished rendering current frame before proceeding
+        /// </summary>
+        public static async Task WaitForEndOfFrame(CancellationToken ct = default)
+        {
+            var tcs = new TaskCompletionSource<bool>();
+            
+            // Check dispatcher
+            if (UnityMainThreadDispatcher.Instance == null)
+            {
+                Debug.LogWarning("WaitForEndOfFrame: Dispatcher missing, falling back to WaitFrames(1)");
+                await WaitFrames(1, ct);
+                return;
+            }
+
+            UnityMainThreadDispatcher.Enqueue(() =>
+            {
+                UnityMainThreadDispatcher.Instance.StartCoroutine(CoWaitForEndOfFrame(tcs, ct));
+            });
+            
+            await tcs.Task;
+        }
+
+        private static System.Collections.IEnumerator CoWaitForEndOfFrame(TaskCompletionSource<bool> tcs, CancellationToken ct)
+        {
+            yield return new WaitForEndOfFrame();
+            if (ct.IsCancellationRequested) tcs.SetCanceled();
+            else tcs.SetResult(true);
+        }
     }
+
 }

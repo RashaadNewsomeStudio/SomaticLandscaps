@@ -612,6 +612,9 @@ PlayerSettings:
   - serializedVersion: 2
     m_BuildTarget: Android
     m_EncodingQuality: 1
+  - serializedVersion: 2
+    m_BuildTarget: Standalone
+    m_EncodingQuality: 0
   m_BuildTargetGroupHDRCubemapEncodingQuality: []
   m_BuildTargetGroupLightmapSettings: []
   m_BuildTargetGroupLoadStoreDebugModeSettings: []
@@ -896,7 +899,8 @@ PlayerSettings:
     Android: 1
     Standalone: 1
   il2cppCompilerConfiguration: {}
-  il2cppCodeGeneration: {}
+  il2cppCodeGeneration:
+    Standalone: 1
   il2cppStacktraceInformation: {}
   managedStrippingLevel:
     Android: 1

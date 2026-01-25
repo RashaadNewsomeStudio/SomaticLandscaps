@@ -33,7 +33,11 @@ public class VideoMemoryFix : MonoBehaviour
         long vRam   = SystemInfo.graphicsMemorySize;
         
         // Revised: > 12GB RAM and > 4GB VRAM
-        if (sysRam > 12000 && vRam > 4000)
+        // Revised: > 12GB RAM and > 4GB VRAM
+        // PRO FIX: For 5K textures (5280x1620), we ALWAYS want aggressive cleanup ("Safe Mode").
+        // "High Performance" mode skips GC/Unload, which causes VRAM fragmentation with 5K textures.
+        // So we force IsHighPerformance = false to ensure stability over raw speed.
+        if (false && sysRam > 12000 && vRam > 4000) // DISABLED: Force Safe Mode
         {
             IsHighPerformance = true;
             Debug.Log($"[VideoMemoryFix] High-End System Detected (RAM:{sysRam}MB, VRAM:{vRam}MB). Unlocking performance.");
@@ -41,8 +45,9 @@ public class VideoMemoryFix : MonoBehaviour
         else
         {
             IsHighPerformance = false;
-            Debug.Log($"[VideoMemoryFix] Standard System Detected (RAM:{sysRam}MB, VRAM:{vRam}MB). Using safe limits.");
+            Debug.Log($"[VideoMemoryFix] PRO STABILITY MODE: Forcing safe VRAM limits for 5K textures (System: {sysRam}MB/{vRam}MB).");
         }
+
 
         if (IsHighPerformance)
         {

@@ -1278,6 +1278,8 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: ef10932e734c3d74d87410616d51988b, type: 3}
   m_Name: 
   m_EditorClassIdentifier: 
+  _cfgW: 5280
+  _cfgH: 1620
   ignoreAmbientWhileActive: 1
   introPanel: {fileID: 7853414469306871034}
   introGroup: {fileID: 8122286961723255653}
@@ -1443,7 +1445,7 @@ MonoBehaviour:
   - {fileID: 8300000, guid: c23196b466e2f7c43a0e166b52f1f50c, type: 3}
   musicVolume: 1
   musicRampIn: 1
-  musicFadeIn: 2
+  musicFadeIn: 0.5
   musicRampOut: 2
   musicSyncWithActiveFade: 0
   hapOpenTimeout: 6
@@ -1454,30 +1456,21 @@ MonoBehaviour:
   hapQuarantineAfterFailures: 3
   activeButton: {fileID: 5103689232812618836}
   ambientButton: {fileID: 2126225725}
-  tuningPanel: {fileID: 1123189779102257408}
-  sIdleFade: {fileID: 8915226656201025122}
-  sIdlePrepareLead: {fileID: 5983154593111917854}
-  sIdleMinFade: {fileID: 4116095747746902721}
-  sActiveFadeIn: {fileID: 2360786836497143646}
-  sActiveFadeOut: {fileID: 7072916777653479423}
-  sReturnFade: {fileID: 4091758158509767861}
-  sReturnBlackHold: {fileID: 398184460027350767}
-  sMusicRampIn: {fileID: 1960761388811872954}
-  sMusicFadeIn: {fileID: 8067023484556742658}
-  sMusicRampOut: {fileID: 5820670611465638890}
-  tRandomizeIdleStartOnReturn: {fileID: 8848793652153930246}
-  tMusicSyncWithActiveFade: {fileID: 587797390140033374}
-  vIdleFade: {fileID: 8700683780795339332}
-  vIdlePrepareLead: {fileID: 8978456968400389675}
-  vIdleMinFade: {fileID: 8124049839134892620}
-  vActiveFadeIn: {fileID: 3535855156598795483}
-  vActiveFadeOut: {fileID: 7307116939632606006}
-  vReturnFade: {fileID: 5847449109271819587}
-  vReturnBlackHold: {fileID: 8803837222302120616}
-  vMusicRampIn: {fileID: 6524777124106460973}
-  vMusicFadeIn: {fileID: 5969410795990083959}
-  vMusicRampOut: {fileID: 93568183495408394}
-  panelToggleKey: 282
+  usingA: 1
+  inIdle: 1
+  activeRunning: 0
+  lastIdleIndexA: -1
+  lastIdleIndexB: -1
+  _idlePrimedFromReturn: 0
+  _returnStartIsA: 1
+  _returnStartWithA: 1
+  _ownIdleA: {fileID: 0}
+  _ownIdleB: {fileID: 0}
+  _ownActive: {fileID: 0}
+  _externalAmbientPath: 
+  _externalActivePath: 
+  _externalAudioPath: 
+  audioSource: {fileID: 624225095}
 --- !u!4 &649305180
 Transform:
   m_ObjectHideFlags: 0
@@ -2987,6 +2980,37 @@ CanvasRenderer:
   m_PrefabAsset: {fileID: 0}
   m_GameObject: {fileID: 1898247324}
   m_CullTransparentMesh: 1
+--- !u!1 &2019874119
+GameObject:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  serializedVersion: 6
+  m_Component:
+  - component: {fileID: 2019874120}
+  m_Layer: 0
+  m_Name: AutoLogCanvas
+  m_TagString: Untagged
+  m_Icon: {fileID: 0}
+  m_NavMeshLayer: 0
+  m_StaticEditorFlags: 0
+  m_IsActive: 1
+--- !u!4 &2019874120
+Transform:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 2019874119}
+  serializedVersion: 2
+  m_LocalRotation: {x: 0, y: 0, z: 0, w: 1}
+  m_LocalPosition: {x: 0, y: 0, z: 0}
+  m_LocalScale: {x: 1, y: 1, z: 1}
+  m_ConstrainProportionsScale: 0
+  m_Children: []
+  m_Father: {fileID: 0}
+  m_LocalEulerAnglesHint: {x: 0, y: 0, z: 0}
 --- !u!1 &2126225723
 GameObject:
   m_ObjectHideFlags: 0
@@ -12466,3 +12490,4 @@ SceneRoots:
   - {fileID: 147937987}
   - {fileID: 622929783}
   - {fileID: 348430}
+  - {fileID: 2019874120}
