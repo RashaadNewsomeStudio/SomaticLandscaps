@@ -241,8 +241,9 @@ public class ActiveFlow
             _ctrl._returnStartIsA = _ctrl.usingA;
             _ctrl._idlePrimedFromReturn = true;
             
-            // Start the loop (it will see _idlePrimedFromReturn and skip re-prep)
-            _ = _idle.StartIdleLoopOwnedAsync(ct);
+            // CRITICAL: Start idle with controller lifetime token, NOT active session token
+            // ct is the active session token which will be cancelled when next active starts
+            _ = _idle.StartIdleLoopOwnedAsync(_ctrl.LifetimeToken);
             
             ControllerMain.LogStep(isForced ? "Forced return to idle complete." : $"Active complete (session={sessionId}). Returned to idle.");
         }
@@ -253,8 +254,8 @@ public class ActiveFlow
         catch (Exception ex)
         {
             ControllerMain.LogError($"CleanupAndReturnToIdle CRASHED: {ex.Message}\n{ex.StackTrace}");
-            // Attempt to restart idle anyway if we crashed
-             _ = _idle.StartIdleNowAsync(ct);
+            // Attempt to restart idle anyway if we crashed (use controller lifetime token)
+             _ = _idle.StartIdleLoopOwnedAsync(_ctrl.LifetimeToken);
         }
         finally
         {

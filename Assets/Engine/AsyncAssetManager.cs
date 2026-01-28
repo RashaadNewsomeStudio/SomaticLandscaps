@@ -218,7 +218,11 @@ namespace SomaticLandscapes.Async
                     }
                     finally { _videoLoadSemaphore.Release(); }
                 }
-                catch (Exception e) { 
+                catch (Exception
+#if UNITY_EDITOR || DEVELOPMENT_BUILD
+                    e
+#endif
+                ) { 
 #if UNITY_EDITOR || DEVELOPMENT_BUILD
                     LogWarning($"Load error: {e.Message}");
 #endif

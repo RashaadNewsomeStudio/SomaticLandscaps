@@ -29,6 +29,9 @@ public class ArtworkController : MonoBehaviour
     private CancellationTokenSource _cts;
     private CancellationTokenSource _activeCts;
     private CancellationTokenSource _idleCts;
+    
+    // Expose controller lifetime token for proper cancellation hierarchy
+    public CancellationToken LifetimeToken => _cts?.Token ?? CancellationToken.None;
 
     // -- SERIALIZED FIELDS --
 

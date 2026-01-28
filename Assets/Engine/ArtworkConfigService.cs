@@ -34,6 +34,9 @@ using UnityEngine;
         // Flags from JSON
         public bool IgnoreAmbientWhileActive   = false;
         public bool ActiveClickCancelsToAmbient = false;
+        
+        // OSC Control: Block "0 ambient" commands from forcing return to idle
+        public bool OscBlockReturnToIdle = false;
 
         // Music loader controls
         public bool   AutoLoadMusicFromStreaming = true;
@@ -141,6 +144,15 @@ using UnityEngine;
 
             // Apply behavior toggle from JSON
             _ctrl.ignoreAmbientWhileActive   = c.IgnoreAmbientWhileActive;
+            
+            // OSC Control: Block return-to-idle commands
+            var oscController = UnityEngine.Object.FindFirstObjectByType<ArtworkModeController>();
+            if (oscController != null)
+            {
+                oscController.blockReturnToIdle = c.OscBlockReturnToIdle;
+                if (c.OscBlockReturnToIdle)
+                    ControllerMain.LogInfo("[ArtworkConfig] OSC return-to-idle (0) commands BLOCKED");
+            }
 
             // Loader config
             _ctrl.autoLoadMusicFromStreaming = c.AutoLoadMusicFromStreaming;

@@ -15,6 +15,7 @@ public class ArtworkModeController : MonoBehaviour
     public int listenPort = 7000;
     public string oscAddress = "/artwork/active";
     public bool acceptFloat = true;
+    [HideInInspector] public bool blockReturnToIdle = false; // Set via ArtworkConfig.json
 
     [Header("References")]
     public ArtworkController ctrl;
@@ -140,6 +141,13 @@ public class ArtworkModeController : MonoBehaviour
 
                     if (parsed)
                     {
+                         // FILTER: Block return-to-idle (0) commands if enabled in config
+                         if (val == 0 && blockReturnToIdle)
+                         {
+                             ControllerMain.LogInfo($"[OSC_BLOCKED] Return-to-idle command (0) ignored (blockReturnToIdle=true)");
+                             continue; // Skip processing this command
+                         }
+                         
                          // Always log state changes or periodic updates
                          if (val != _lastLevel)
                          {

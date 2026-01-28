@@ -27,6 +27,7 @@ public class IdleAmbientLoop
 
     // Async State
     private CancellationTokenSource _prepA, _prepB, _idleCts;
+    private CancellationToken _idleRootToken = CancellationToken.None; // Root lifetime token (not loop token)
     private Task _prepTaskA = Task.CompletedTask, _prepTaskB = Task.CompletedTask, _idleTask = Task.CompletedTask;
     // State for Logging
     private string _loadedPathA, _loadedPathB;
@@ -67,6 +68,10 @@ public class IdleAmbientLoop
 
     public Task StartIdleLoopOwnedAsync(CancellationToken globalCt)
     {
+        // CRITICAL: Store root token FIRST before cancelling old loop token
+        // This allows crash recovery to restart using the root token, not the cancelled loop token
+        _idleRootToken = globalCt;
+        
         _idleCts?.Cancel(); _idleCts?.Dispose();
         _idleCts = CancellationTokenSource.CreateLinkedTokenSource(globalCt);
         _idleTask = IdleLoopAsync(_idleCts.Token);
@@ -149,10 +154,12 @@ public class IdleAmbientLoop
                 float tPrepare   = Mathf.Max(0f, len - (targetFade + _ctrl.idlePrepareLead));
                 float tFadeStart = Mathf.Max(0f, len - targetFade);
 
-                // FIX 5: Debug Timing
+#if UNITY_EDITOR || DEVELOPMENT_BUILD
+                // Debug Timing (dev builds only - prevents log spam in production)
                  ControllerMain.LogInfo(
                   $"[IdleTiming] usingA={_ctrl.usingA} len={len:F2} time={(active!=null?(float)active.time:-1f):F2} " +
                   $"tPrepare={tPrepare:F2} tFadeStart={tFadeStart:F2} fade={targetFade:F2}");
+#endif
 
                 // FIX 2: Better WaitUntil Logic (Wall-clock timeout)
                 float startWait = Time.realtimeSinceStartup;
@@ -234,10 +241,18 @@ public class IdleAmbientLoop
             ControllerMain.LogError($"[Idle] Loop crashed: {ex.Message}\n{ex.StackTrace}");
 
             // Auto-recover if we should still be running
-            if (!ShouldStop() && !ct.IsCancellationRequested)
+            // CRITICAL: Use _idleRootToken (not ct) to avoid self-cancellation
+            if (!ShouldStop() && !_idleRootToken.IsCancellationRequested)
             {
-                await AsyncExtensions.WaitForSecondsRealtime(0.5f, ct);
-                _ = StartIdleLoopOwnedAsync(ct); // restart owned
+                // GUARD: Prevent dual loops if crash happens during active transition
+                if (_idleTask != null && !_idleTask.IsCompleted)
+                {
+                    ControllerMain.LogWarn("[Idle] Recovery deferred - previous loop still running");
+                    return;
+                }
+                
+                await AsyncExtensions.WaitForSecondsRealtime(0.5f, _idleRootToken);
+                _ = StartIdleLoopOwnedAsync(_idleRootToken); // Restart with root token
             }
         }
     }
