@@ -2,15 +2,15 @@ using UnityEngine;
 using UnityEngine.UI;        // RawImage + AspectRatioFitter
 using Klak.Spout;
 
-/// Fixed Spout texture output + adaptive fullscreen preview on any monitor.
+/// <summary>
+/// REFACTORED: Passive Spout bridge that sends an externally-managed RenderTexture.
+/// No longer creates its own RT or changes screen resolution (those are handled by ArtworkController).
+/// This eliminates redundant GPU surface creation and swapchain churn.
+/// </summary>
 [RequireComponent(typeof(Camera))]
 [RequireComponent(typeof(SpoutSender))]
 public class ForceSpoutTexture : MonoBehaviour
 {
-    [Header("Spout Output (fixed)")]
-    public int spoutWidth  = 5280;
-    public int spoutHeight = 1620;
-
     [Header("Preview / UX")]
     [Tooltip("Mirror the Spout RT to the window so operators can see it.")]
     public bool previewOnScreen = true;
@@ -23,7 +23,7 @@ public class ForceSpoutTexture : MonoBehaviour
 
     private SpoutSender   sender;
     private Camera        cam;
-    private RenderTexture spoutRT;
+    private RenderTexture externalSourceRT;  // The RT we receive from ArtworkController
 
     // UI preview
     private Canvas   previewCanvas;
@@ -36,41 +36,34 @@ public class ForceSpoutTexture : MonoBehaviour
     {
         sender = GetComponent<SpoutSender>();
         cam    = GetComponent<Camera>();
-        
-        // Wait for external init via ArtworkController. 
-        // If not called by Start(), we auto-init with inspector values.
     }
 
-    private void Start()
+    /// <summary>
+    /// Initialize the Spout bridge with an externally-managed source RT.
+    /// This can be called multiple times if the source RT changes (e.g., config reload).
+    /// </summary>
+    public void Initialize(RenderTexture sourceRT)
     {
-        if (!_initialized)
-            Initialize(spoutWidth, spoutHeight);
-    }
-
-    public void Initialize(int w, int h)
-    {
-        if (_initialized) return;
-
-        // Safety: Ensure components are found if Awake hasn't run yet (Execution Order)
-        if (sender == null) sender = GetComponent<SpoutSender>();
-        if (cam == null)    cam    = GetComponent<Camera>();
-
-        spoutWidth = w;
-        spoutHeight = h;
-
-        // 1) Create fixed-size RenderTexture for Spout (depth=24 to match RenderGraph requirements)
-        spoutRT = new RenderTexture(spoutWidth, spoutHeight, 24, RenderTextureFormat.ARGB32)
+        if (sourceRT == null)
         {
-            useMipMap        = false,
-            autoGenerateMips = false,
-            antiAliasing     = 1,
-            name             = $"SpoutRT_{spoutWidth}x{spoutHeight}"
-        };
-        spoutRT.Create();
+            Debug.LogError("[ForceSpoutTexture] Cannot initialize with null RenderTexture!");
+            return;
+        }
 
-        // 2) Render this camera into the RT and send it via Spout (Texture mode)
-        cam.targetTexture    = spoutRT;
-        sender.sourceTexture = spoutRT;
+        // Allow re-init if the source RT changes
+        if (_initialized && externalSourceRT == sourceRT)
+        {
+            Debug.Log("[ForceSpoutTexture] Already initialized with this RT, skipping.");
+            return;
+        }
+
+        externalSourceRT = sourceRT;
+
+        // Wire the Camera to render into the external RT
+        cam.targetTexture = externalSourceRT;
+
+        // Wire Spout to send the external RT (Texture mode)
+        sender.sourceTexture = externalSourceRT;
 
         // PRODUCTION FIX: Make Spout camera "boring" - no post-processing, minimal features
         // Why: URP RenderGraph + post-processing + RenderTexture output = instability
@@ -83,30 +76,15 @@ public class ForceSpoutTexture : MonoBehaviour
         }
         #endif
 
-        // 3) Make the game window fill the current monitor (any resolution)
-        int sysW = Display.main.systemWidth;
-        int sysH = Display.main.systemHeight;
+        // On-screen preview (letterboxed) so operators see the correct aspect
+        if (previewOnScreen && !_initialized)
+            CreateFullscreenPreview(externalSourceRT);
 
-        var refreshRate = Screen.currentResolution.refreshRateRatio;
-        Screen.SetResolution(
-            sysW,
-            sysH,
-            FullScreenMode.FullScreenWindow,
-            refreshRate // Use display's native refresh rate
-        );
-
-        if (Display.displays.Length > 0)
-            Display.displays[0].Activate();
-
-        // 4) On-screen preview (letterboxed) so operators see the correct aspect
-        if (previewOnScreen)
-            CreateFullscreenPreview(spoutRT);
-
-        // 5) Suppress "No cameras rendering" overlay
-        if (hideNoCameraOverlay)
+        // Suppress "No cameras rendering" overlay
+        if (hideNoCameraOverlay && !_initialized)
             CreateDummyDisplayCamera();
 
-        Debug.Log($"[Spout] Output Initialized: {spoutWidth}x{spoutHeight}. Screen: {sysW}x{sysH}.");
+        Debug.Log($"[ForceSpoutTexture] Initialized with external RT: {externalSourceRT.name} ({externalSourceRT.width}x{externalSourceRT.height})");
         _initialized = true;
     }
 
@@ -174,18 +152,13 @@ public class ForceSpoutTexture : MonoBehaviour
         if (dummyDisplayCam != null)
             Destroy(dummyDisplayCam.gameObject);
 
-        // Unbind camera & Spout
+        // Unbind camera & Spout (but DON'T destroy the external RT - we don't own it)
         if (cam != null)
             cam.targetTexture = null;
         if (sender != null)
             sender.sourceTexture = null;
 
-        // Destroy RT
-        if (spoutRT != null)
-        {
-            spoutRT.Release();
-            Destroy(spoutRT);
-        }
+        // NOTE: We do NOT destroy externalSourceRT - it's owned by ArtworkController
     }
 
     public void PauseOutput(bool paused)

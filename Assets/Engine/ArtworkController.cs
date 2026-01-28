@@ -82,6 +82,12 @@ public class ArtworkController : MonoBehaviour
     public HapPlayer      idleA, idleB, activeHP;
     public CanvasGroup    idleGA, idleGB, activeGroup;
 
+    // SPOUT OUTPUT
+    [Header("OUTPUT")]
+    [Tooltip("The single master RT that gets sent to Spout. All video content is composited here.")]
+    public RenderTexture finalOutputRT;
+    private ForceSpoutTexture spoutBridge;
+
     // LISTS
     [Header("FILES")]
     public StreamingAssetRef[] idleShared, idleAList, idleBList, activeList;
@@ -145,6 +151,15 @@ public class ArtworkController : MonoBehaviour
         _assetManager = AsyncAssetManager.Instance;
         if (!_assetManager) _assetManager = new GameObject("AsyncAssetManager").AddComponent<AsyncAssetManager>();
 
+        // CRITICAL: Set screen resolution ONCE at boot (before any video/Spout operations)
+        // This prevents GPU swapchain churn during playback
+        int sysW = Display.main.systemWidth;
+        int sysH = Display.main.systemHeight;
+        var refreshRate = Screen.currentResolution.refreshRateRatio;
+        Screen.SetResolution(sysW, sysH, FullScreenMode.FullScreenWindow, refreshRate);
+        if (Display.displays.Length > 0) Display.displays[0].Activate();
+        Debug.Log($"[Boot] Screen set to {sysW}x{sysH} @ {refreshRate}Hz");
+
         // Get external paths from ControllerMain
         var cm = FindFirstObjectByType<ControllerMain>();
         if (cm != null)
@@ -153,6 +168,9 @@ public class ArtworkController : MonoBehaviour
             _externalActivePath  = cm.ActiveStreamPath;
             _externalAudioPath   = cm.AudioPath;
         }
+
+        // Find the Spout bridge early (it will be initialized later with finalOutputRT)
+        spoutBridge = FindFirstObjectByType<ForceSpoutTexture>();
 
         _config  = new ArtworkConfigService(this);
         _media   = new MediaDiscoveryService(this, _assetManager);
@@ -166,6 +184,31 @@ public class ArtworkController : MonoBehaviour
         _startup = new StartupPanelsFlow(this);
 
         _config.TryLoadAndApply(true);      
+        
+        // Initialize the master output RT (Spout will send this)
+        if (!finalOutputRT)
+        {
+            int w = Mathf.Max(16, _cfgW), h = Mathf.Max(16, _cfgH);
+            finalOutputRT = new RenderTexture(w, h, 24, RenderTextureFormat.ARGB32)
+            {
+                name = "FinalOutput_SpoutRT",
+                wrapMode = TextureWrapMode.Clamp,
+                useMipMap = false,
+                antiAliasing = 1
+            };
+            finalOutputRT.Create();
+            Debug.Log($"[Output] Created FinalOutputRT: {w}x{h}");
+        }
+
+        // Wire the Spout bridge to use our master output RT
+        if (spoutBridge != null)
+        {
+            spoutBridge.Initialize(finalOutputRT);
+        }
+        else
+        {
+            Debug.LogWarning("[Output] ForceSpoutTexture not found! Spout output will not work.");
+        }
         
         EnsureRTs();
         WirePlayersToRTs();
@@ -273,17 +316,65 @@ public class ArtworkController : MonoBehaviour
     // ==========================================
     // API
     // ==========================================
+    
+    // SAFETY: Trigger Cooldown
+    public float triggerCooldown = 2.0f;
+    private float _lastTriggerTime = -999f;
 
-    public void ReceiveActive(int value) => _active.ReceiveActive(value);
-    public void SetActive(bool on)
+    /// <summary>
+    /// Dual-layer safety check for trigger requests.
+    /// GUARD 1: State protection (prevent re-triggering while active)
+    /// GUARD 2: Cooldown enforcement (rate limiting)
+    /// </summary>
+    private bool CheckTriggerAllowed(bool isActiveRequest, string source)
     {
-        if (on) _active.TriggerActive("External", ref _activeCts, _cts.Token);
-        else    _active.RequestReturnToIdle(ref _activeCts, _cts.Token);
+        // GUARD 1: State Protection
+        if (isActiveRequest && activeRunning)
+        {
+            ControllerMain.LogWarn($"[{source}] Active TRIGGER IGNORED: Already running");
+            return false;
+        }
+
+        // GUARD 2: Cooldown Enforcement
+        if (Time.time - _lastTriggerTime < triggerCooldown)
+        {
+            string action = isActiveRequest ? "Active" : "Idle";
+            float elapsed = Time.time - _lastTriggerTime;
+            ControllerMain.LogWarn($"[{source}] {action} TRIGGER BLOCKED: Cooldown active ({elapsed:0.000}s < {triggerCooldown:0.000}s)");
+            return false;
+        }
+
+        return true;
     }
 
-    public void OnActiveButtonClicked() { 
-        // Legacy: Logic moved to ActiveTriggerButton.cs
-        // Kept empty or remove if no other references.
+    public void ReceiveActive(int value)
+    {
+        bool isActiveRequest = (value == 1);
+        if (!CheckTriggerAllowed(isActiveRequest, "OSC"))
+            return;
+
+        _active.ReceiveActive(value);
+        _lastTriggerTime = Time.time;
+    }
+
+    public void SetActive(bool on)
+    {
+        if (!CheckTriggerAllowed(on, "SetActive"))
+            return;
+
+        if (on) _active.TriggerActive("External", ref _activeCts, _cts.Token);
+        else    _active.RequestReturnToIdle(ref _activeCts, _cts.Token);
+        
+        _lastTriggerTime = Time.time;
+    }
+
+    /// <summary>
+    /// Internal hook for ActiveFlow to update timestamp on natural state changes.
+    /// Called when video finishes naturally and returns to idle.
+    /// </summary>
+    public void UpdateTriggerTimestamp()
+    {
+        _lastTriggerTime = Time.time;
     }
 
     // ==========================================

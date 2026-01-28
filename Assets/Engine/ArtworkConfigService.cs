@@ -44,6 +44,9 @@ using UnityEngine;
 
         // NEW: enable/disable startup panels (intro + screen adjustment)
         public bool EnableStartupPanels = true;
+        
+        // Safety: Prevent rapid toggling
+        public float TriggerCooldown = 2.0f;
     }
 
     public class ArtworkConfigService
@@ -114,12 +117,35 @@ using UnityEngine;
             _ctrl._cfgW = Mathf.Max(16, c.ResolutionWidth);
             _ctrl._cfgH = Mathf.Max(16, c.ResolutionHeight);
 
-            // FIX: Inject resolution into ForceSpoutTexture BEFORE creating RTs
-            var spouter = UnityEngine.Object.FindFirstObjectByType<ForceSpoutTexture>();
-            if (spouter != null)
+            // Update or create finalOutputRT if resolution changed
+            if (_ctrl.finalOutputRT == null || 
+                _ctrl.finalOutputRT.width != _ctrl._cfgW || 
+                _ctrl.finalOutputRT.height != _ctrl._cfgH)
             {
-                spouter.Initialize(_ctrl._cfgW, _ctrl._cfgH);
-                Debug.Log($"[ArtworkController] Configured Spout to {_ctrl._cfgW}x{_ctrl._cfgH}");
+                // Release old RT if it exists
+                if (_ctrl.finalOutputRT != null)
+                {
+                    _ctrl.finalOutputRT.Release();
+                    UnityEngine.Object.Destroy(_ctrl.finalOutputRT);
+                }
+
+                // Create new finalOutputRT with updated resolution
+                _ctrl.finalOutputRT = new RenderTexture(_ctrl._cfgW, _ctrl._cfgH, 24, RenderTextureFormat.ARGB32)
+                {
+                    name = "FinalOutput_SpoutRT",
+                    wrapMode = TextureWrapMode.Clamp,
+                    useMipMap = false,
+                    antiAliasing = 1
+                };
+                _ctrl.finalOutputRT.Create();
+                Debug.Log($"[ArtworkConfig] Updated FinalOutputRT to {_ctrl._cfgW}x{_ctrl._cfgH}");
+
+                // Re-initialize Spout bridge with new RT
+                var spouter = UnityEngine.Object.FindFirstObjectByType<ForceSpoutTexture>();
+                if (spouter != null)
+                {
+                    spouter.Initialize(_ctrl.finalOutputRT);
+                }
             }
 
             RecreateRTIfMismatch(ref _ctrl.idleRT_A, ref _ctrl._ownIdleA, "IdleA_RT", _ctrl._cfgW, _ctrl._cfgH);
@@ -169,6 +195,9 @@ using UnityEngine;
             _ctrl.autoLoadMusicFromStreaming = c.AutoLoadMusicFromStreaming;
             if (!string.IsNullOrEmpty(c.MusicSubfolder))
                  _ctrl.musicSubfolder = c.MusicSubfolder;
+
+            // Apply Cooldown
+            _ctrl.triggerCooldown = Mathf.Max(0.5f, c.TriggerCooldown);
 
             // NEW: startup panels flag
             StartupPanelsEnabled = c.EnableStartupPanels;
