@@ -20,114 +20,85 @@ public class MediaDiscoveryService
 
     public void AutoPopulateIfNeeded()
     {
-        // Simple sync check to populate default lists if empty
-        AutoPopulateFromStreamingAssets();
+        // Ambient: Check A, B, and Shared
+        bool hasAmbient = ArtworkController.HasAnyValid(_ctrl.idleAList) || 
+                          ArtworkController.HasAnyValid(_ctrl.idleBList) || 
+                          ArtworkController.HasAnyValid(_ctrl.idleShared);
+        
+        if (!hasAmbient) AutoPopulateList(ref _ctrl.idleShared, "Ambient");
+        
+        // Active
+        if (!ArtworkController.HasAnyValid(_ctrl.activeList)) 
+            AutoPopulateList(ref _ctrl.activeList, "Active");
+    }
+
+    private void AutoPopulateList(ref ArtworkController.StreamingAssetRef[] list, string subfolder)
+    {
+        string dir = Path.Combine(Application.streamingAssetsPath, subfolder).Replace('\\', '/');
+        if (!Directory.Exists(dir)) return;
+
+        var temp = new List<ArtworkController.StreamingAssetRef>();
+        foreach (var f in Directory.GetFiles(dir, "*.mov"))
+            temp.Add(new ArtworkController.StreamingAssetRef { relativePath = $"{subfolder}/{Path.GetFileName(f)}" });
+
+        if (temp.Count > 0)
+        {
+            list = temp.ToArray();
+            ControllerMain.LogStep($"[MediaDiscovery] Auto-populated {subfolder} (Sync): {temp.Count} files");
+        }
     }
 
     public async Task AutoDiscoverVideosAsync(CancellationToken ct)
     {
-        var idleSharedList = new List<ArtworkController.StreamingAssetRef>(_ctrl.idleShared ?? new ArtworkController.StreamingAssetRef[0]);
-        var activeListList = new List<ArtworkController.StreamingAssetRef>(_ctrl.activeList ?? new ArtworkController.StreamingAssetRef[0]);
+        var idleList = new List<ArtworkController.StreamingAssetRef>(_ctrl.idleShared ?? new ArtworkController.StreamingAssetRef[0]);
+        var activeList = new List<ArtworkController.StreamingAssetRef>(_ctrl.activeList ?? new ArtworkController.StreamingAssetRef[0]);
 
-        var existingIdle = new HashSet<string>(idleSharedList.Select(r => Path.GetFileName(ArtworkController.GetRel(r) ?? "")), StringComparer.OrdinalIgnoreCase);
-        var existingAct  = new HashSet<string>(activeListList.Select(r => Path.GetFileName(ArtworkController.GetRel(r) ?? "")), StringComparer.OrdinalIgnoreCase);
+        await DiscoverAndAppend(idleList, _ctrl._externalAmbientPath, "Ambient", ct);
+        await DiscoverAndAppend(activeList, _ctrl._externalActivePath, "Active", ct);
 
-        // Ambient Discovery
-        if (!string.IsNullOrEmpty(_ctrl._externalAmbientPath) && Directory.Exists(_ctrl._externalAmbientPath))
-            await TryAppendMovsFromFolderAsync(_ctrl._externalAmbientPath, idleSharedList, existingIdle, null, ct);
-        else
-        {
-            var saAmbient = Path.Combine(Application.streamingAssetsPath, "Ambient");
-            if (Directory.Exists(saAmbient))
-                await TryAppendMovsFromFolderAsync(saAmbient, idleSharedList, existingIdle, "Ambient", ct);
-        }
-
-        // Active Discovery
-        if (!string.IsNullOrEmpty(_ctrl._externalActivePath) && Directory.Exists(_ctrl._externalActivePath))
-            await TryAppendMovsFromFolderAsync(_ctrl._externalActivePath, activeListList, existingAct, null, ct);
-        else
-        {
-            var saActive = Path.Combine(Application.streamingAssetsPath, "Active");
-            if (Directory.Exists(saActive))
-                await TryAppendMovsFromFolderAsync(saActive, activeListList, existingAct, "Active", ct);
-        }
-
-        _ctrl.idleShared = idleSharedList.ToArray();
-        _ctrl.activeList = activeListList.ToArray();
+        _ctrl.idleShared = idleList.ToArray();
+        _ctrl.activeList = activeList.ToArray();
 
         ControllerMain.LogStep($"Auto-discovered media (Async): Idle={_ctrl.idleShared.Length}, Active={_ctrl.activeList.Length}");
     }
 
-    private void AutoPopulateFromStreamingAssets()
+    private async Task DiscoverAndAppend(List<ArtworkController.StreamingAssetRef> target, string externalPath, string saSubfolder, CancellationToken ct)
     {
-        bool needAmbient = !ArtworkController.HasAnyValid(_ctrl.idleAList) && !ArtworkController.HasAnyValid(_ctrl.idleBList) && !ArtworkController.HasAnyValid(_ctrl.idleShared);
-        bool needActive  = !ArtworkController.HasAnyValid(_ctrl.activeList);
-        if (!needAmbient && !needActive) return;
-
-        string saRoot = Application.streamingAssetsPath.Replace('\\', '/');
-
-        if (needAmbient)
+        var existing = new HashSet<string>(target.Select(r => Path.GetFileName(ArtworkController.GetRel(r) ?? "")), StringComparer.OrdinalIgnoreCase);
+        
+        if (!string.IsNullOrEmpty(externalPath) && Directory.Exists(externalPath))
         {
-            string ambientDir = Path.Combine(saRoot, "Ambient").Replace('\\', '/');
-            if (Directory.Exists(ambientDir))
-            {
-                var files = Directory.GetFiles(ambientDir, "*.mov");
-                var temp = new List<ArtworkController.StreamingAssetRef>();
-                foreach (var f in files)
-                    temp.Add(new ArtworkController.StreamingAssetRef { relativePath = "Ambient/" + Path.GetFileName(f) });
-                if (temp.Count > 0) _ctrl.idleShared = temp.ToArray();
-            }
+             await TryAppendMovsFromFolderAsync(externalPath, target, existing, null, ct);
         }
-
-        if (needActive)
+        else
         {
-            string activeDir = Path.Combine(saRoot, "Active").Replace('\\', '/');
-            if (Directory.Exists(activeDir))
-            {
-                var files = Directory.GetFiles(activeDir, "*.mov");
-                var temp = new List<ArtworkController.StreamingAssetRef>();
-                foreach (var f in files)
-                    temp.Add(new ArtworkController.StreamingAssetRef { relativePath = "Active/" + Path.GetFileName(f) });
-                if (temp.Count > 0) _ctrl.activeList = temp.ToArray();
-            }
+            var saDir = Path.Combine(Application.streamingAssetsPath, saSubfolder);
+            if (Directory.Exists(saDir))
+                 await TryAppendMovsFromFolderAsync(saDir, target, existing, saSubfolder, ct);
         }
     }
 
-    private async Task TryAppendMovsFromFolderAsync(
-        string folderAbs, 
-        List<ArtworkController.StreamingAssetRef> target, 
-        HashSet<string> existingNames, 
-        string relativeBaseForSA, 
-        CancellationToken ct)
+    private async Task TryAppendMovsFromFolderAsync(string folder, List<ArtworkController.StreamingAssetRef> target, HashSet<string> existing, string relBase, CancellationToken ct)
     {
-        string[] files;
         try
         {
-            // Use AsyncAssetManager for threaded discovery
-            var f1 = await _assetManager.DiscoverVideosAsync(folderAbs, "*.mov", ct);
-            var f2 = await _assetManager.DiscoverVideosAsync(folderAbs, "*.MOV", ct);
-            files = f1.Concat(f2).Distinct().ToArray();
-        }
-        catch
-        {
-            // Fallback
-                files = await _assetManager.DiscoverVideosAsync(folderAbs, "*.mov", ct);
-        }
-
-        foreach (var abs in files)
-        {
-            var name = Path.GetFileName(abs);
-            if (string.IsNullOrEmpty(name) || existingNames.Contains(name)) continue;
-
-            var r = new ArtworkController.StreamingAssetRef
+            var f1 = await _assetManager.DiscoverVideosAsync(folder, "*.mov", ct);
+            var f2 = await _assetManager.DiscoverVideosAsync(folder, "*.MOV", ct);
+            
+            foreach (var abs in f1.Concat(f2).Distinct())
             {
-                relativePath = string.IsNullOrEmpty(relativeBaseForSA)
-                    ? name
-                    : relativeBaseForSA.Replace('\\', '/').TrimEnd('/') + "/" + name
-            };
+                var name = Path.GetFileName(abs);
+                if (string.IsNullOrEmpty(name) || existing.Contains(name)) continue;
 
-            target.Add(r);
-            existingNames.Add(name);
+                target.Add(new ArtworkController.StreamingAssetRef {
+                    relativePath = string.IsNullOrEmpty(relBase) ? name : $"{relBase}/{name}"
+                });
+                existing.Add(name);
+            }
+        }
+        catch (Exception ex)
+        {
+            ControllerMain.LogWarn($"Discovery failed in {folder}: {ex.Message}");
         }
     }
 

@@ -46,14 +46,12 @@ using UnityEngine;
     public class ArtworkConfigService
     {
         private readonly ArtworkController _ctrl;
-        private readonly RtDisposalQueue _rtQueue;
 
         public bool StartupPanelsEnabled { get; private set; } = true;
 
-        public ArtworkConfigService(ArtworkController ctrl, RtDisposalQueue rtQueue)
+        public ArtworkConfigService(ArtworkController ctrl)
         {
             _ctrl = ctrl;
-            _rtQueue = rtQueue;
         }
 
         public void TryLoadAndApply()
@@ -151,9 +149,9 @@ using UnityEngine;
 
             // NEW: startup panels flag
             StartupPanelsEnabled = c.EnableStartupPanels;
+            ControllerMain.LogInfo($"[ArtworkConfig] Parsed 'EnableStartupPanels': {StartupPanelsEnabled}");
             // Also update controller field if needed (though we can just use this property)
 
-            _ctrl.RefreshSlidersFromVars();
             ControllerMain.LogStep("[ArtworkController] Applied ArtworkConfig.json");
         }
 
@@ -164,10 +162,12 @@ using UnityEngine;
             {
                 if (owned) 
                 { 
-                    // Use RtDisposalQueue instead of direct Destroy
+                    // Use AsyncAssetManager instead of direct Destroy or Queue
                     // But we can try Release first
                     try { owned.Release(); } catch {} 
-                    _rtQueue.ScheduleDestroy(owned); 
+                    
+                    // Unified Disposal (PR-03)
+                    SomaticLandscapes.Async.AsyncAssetManager.Instance?.ScheduleDestroy(owned);
                     owned = null; 
                 }
 

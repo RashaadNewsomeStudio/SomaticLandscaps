@@ -17,6 +17,8 @@ public static class CyclePicker
 
             if (cycle.Count == 0)
             {
+                // Refill
+                ControllerMain.LogInfo($"[CyclePicker] Refilling cycle (PoolSize={length})...");
                 cycle.Clear();
                 for (int i = 0; i < length; i++)
                 {
@@ -27,6 +29,7 @@ public static class CyclePicker
                 // If blacklist blocked everything, reset and allow everything
                 if (cycle.Count == 0)
                 {
+                    ControllerMain.LogWarn("[CyclePicker] Blacklist blocked all. Resetting.");
                     for (int i = 0; i < length; i++) cycle.Add(i);
                 }
 
@@ -45,6 +48,8 @@ public static class CyclePicker
             int pick = cycle[0];
             cycle.RemoveAt(0);
             newLastUsed = pick;
+            
+            ControllerMain.LogInfo($"[CyclePicker] Picked {pick}. Remaining in cycle: {cycle.Count}");
             return pick;
         }
 
