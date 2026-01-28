@@ -60,56 +60,57 @@ public class MusicFlow
         }
     }
 
-    public IEnumerator Co_StartMusicAfterDelay(float delay)
+    public async Task StartMusicAfterDelayAsync(float delay, CancellationToken ct)
     {
         // Use inspector-assigned music clips
         if (!_ctrl.musicSource || _ctrl.activeMusicClipsFallback == null || _ctrl.activeMusicClipsFallback.Length == 0) 
-            yield break;
+            return;
         
-        yield return new WaitForSeconds(delay);
+        // Wait for RampIn delay
+        await AsyncExtensions.WaitForSeconds(delay, ct);
         
-        // Pick random clip from inspector array
-        var randomClip = _ctrl.activeMusicClipsFallback[Random.Range(0, _ctrl.activeMusicClipsFallback.Length)];
-        if (randomClip == null) yield break;
+        // Pick random clip
+        var randomClip = _ctrl.activeMusicClipsFallback[UnityEngine.Random.Range(0, _ctrl.activeMusicClipsFallback.Length)];
+        if (randomClip == null) return;
         
         _ctrl.musicSource.Stop();
         _ctrl.musicSource.clip = randomClip;
         _ctrl.musicSource.time = 0f;
+        _ctrl.musicSource.volume = 0f;
         _ctrl.musicSource.Play();
         
-        ControllerMain.LogStep($"Music start: '{randomClip.name}'");
+        ControllerMain.LogInfo($"[Music] PLAYING: '{randomClip.name}'");
         
-        // Sync check
-        if (_ctrl.musicSyncWithActiveFade)
+        // Always fade in smoothly
+        float targetVol = _ctrl.musicVolume;
+        float fadeDur = Mathf.Max(0.01f, _ctrl.musicFadeIn);
+        float t = 0f;
+        
+        while (t < fadeDur)
         {
-            float targetVol = _ctrl.musicVolume;
-            float fadeDur = Mathf.Max(0.01f, _ctrl.musicFadeIn);
-            float t = 0f;
-            _ctrl.musicSource.volume = 0f;
-            while (t < fadeDur)
-            {
-                t += Time.deltaTime;
-                _ctrl.musicSource.volume = Mathf.Lerp(0f, targetVol, t / fadeDur);
-                yield return null;
-            }
-            _ctrl.musicSource.volume = targetVol;
+            ct.ThrowIfCancellationRequested();
+            t += Time.deltaTime;
+            float rawT = Mathf.Clamp01(t / fadeDur);
+            // SmoothStep for better feel (ease-in/ease-out)
+            _ctrl.musicSource.volume = Mathf.Lerp(0f, targetVol, Mathf.SmoothStep(0f, 1f, rawT));
+            await Task.Yield();
         }
-        else
-        {
-            _ctrl.musicSource.volume = _ctrl.musicVolume;
-        }
+        _ctrl.musicSource.volume = targetVol;
     }
 
-    public IEnumerator RampDownToZero(float duration)
+    public async Task RampDownToZeroAsync(float duration, CancellationToken ct)
     {
-        if (!_ctrl.musicSource) yield break;
+        if (!_ctrl.musicSource) return;
         float start = _ctrl.musicSource.volume;
         float t = 0f;
         while (t < duration)
         {
+            ct.ThrowIfCancellationRequested();
             t += Time.deltaTime;
-            _ctrl.musicSource.volume = Mathf.Lerp(start, 0f, t / duration);
-            yield return null;
+            float rawT = Mathf.Clamp01(t / duration);
+            // SmoothStep for fade out
+            _ctrl.musicSource.volume = Mathf.Lerp(start, 0f, Mathf.SmoothStep(0f, 1f, rawT));
+            await Task.Yield();
         }
         _ctrl.musicSource.Stop();
         _ctrl.musicSource.volume = start; 

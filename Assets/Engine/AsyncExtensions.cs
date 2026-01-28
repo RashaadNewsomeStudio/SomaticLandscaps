@@ -10,117 +10,62 @@ namespace SomaticLandscapes.Async
     /// </summary>
     public static class AsyncExtensions
     {
-        /// <summary>
-        /// Async wait for specified seconds (respects Time.timeScale)
-        /// </summary>
         public static async Task WaitForSeconds(float seconds, CancellationToken ct = default)
         {
             float elapsed = 0f;
             while (elapsed < seconds)
             {
-                ct.ThrowIfCancellationRequested();  // Check BEFORE accessing Time.deltaTime
+                ct.ThrowIfCancellationRequested();
                 await Task.Yield();
                 elapsed += Time.deltaTime;
             }
         }
 
-        /// <summary>
-        /// Async wait for specified seconds (ignores Time.timeScale)
-        /// </summary>
         public static async Task WaitForSecondsRealtime(float seconds, CancellationToken ct = default)
         {
             float elapsed = 0f;
             while (elapsed < seconds)
             {
-                ct.ThrowIfCancellationRequested();  // Check BEFORE accessing Time.unscaledDeltaTime
+                ct.ThrowIfCancellationRequested();
                 await Task.Yield();
                 elapsed += Time.unscaledDeltaTime;
             }
         }
 
-        /// <summary>
-        /// Async wait until predicate returns true (production-hardened for cancellation safety)
-        /// </summary>
-        /// <remarks>
-        /// CRITICAL: Checks cancellation BEFORE evaluating predicate to prevent race conditions.
-        /// Wraps predicate in try-catch for graceful handling of null references during teardown.
-        /// </remarks>
-        public static async Task WaitUntil(Func<bool> predicate, CancellationToken ct = default, int maxWaitMs = 30000)
+        public static async Task WaitUntil(Func<bool> predicate, CancellationToken ct = default, int maxWaitMs = -1)
         {
             var startTime = DateTime.UtcNow;
-            
             while (true)
             {
-                // CRITICAL: Check cancellation FIRST before touching any potentially-disposed objects
                 ct.ThrowIfCancellationRequested();
-                
-                // Timeout check
-                if ((DateTime.UtcNow - startTime).TotalMilliseconds > maxWaitMs)
+
+                if (maxWaitMs > 0 && (DateTime.UtcNow - startTime).TotalMilliseconds > maxWaitMs)
                     throw new TimeoutException($"WaitUntil timed out after {maxWaitMs}ms");
+
+                bool result;
+                try { result = predicate(); }
+                catch { result = false; }
                 
-                // Safe predicate evaluation with defensive exception handling
-                bool predicateResult;
-                try
-                {
-                    predicateResult = predicate();
-                }
-                catch (NullReferenceException ex)
-                {
-                    // Graceful degradation: If objects are disposed during teardown, treat as false
-                    Debug.LogWarning($"[AsyncExtensions] WaitUntil predicate threw NullReferenceException (likely during cancellation): {ex.Message}");
-                    predicateResult = false;
-                }
-                catch (Exception ex)
-                {
-                    // Log and re-throw unexpected exceptions for proper error handling
-                    Debug.LogError($"[AsyncExtensions] WaitUntil predicate threw unexpected exception: {ex}");
-                    throw;
-                }
-                
-                if (predicateResult)
-                    break;
-                
+                if (result) break;
                 await Task.Yield();
             }
         }
 
-        /// <summary>
-        /// Wait for specified number of Unity frames (provides GPU synchronization barrier)
-        /// CRITICAL for HAP player lifecycle: ensures GPU finishes processing textures
-        /// PRODUCTION FIX: Uses frameCount instead of float equality for reliability
-        /// </summary>
         public static async Task WaitFrames(int frameCount, CancellationToken ct = default)
         {
-            int startFrame = Time.frameCount;
-            int targetFrame = startFrame + frameCount;
-            
-            while (Time.frameCount < targetFrame)
+            int target = Time.frameCount + frameCount;
+            while (Time.frameCount < target)
             {
                 ct.ThrowIfCancellationRequested();
                 await Task.Yield();
             }
-            
-            // Diagnostic: Log if requested (helps validate frame barriers working)
-            #if UNITY_EDITOR || DEVELOPMENT_BUILD
-            int actualFrames = Time.frameCount - startFrame;
-            if (actualFrames != frameCount)
-            {
-                Debug.LogWarning($"[AsyncExtensions] WaitFrames requested {frameCount}, got {actualFrames} frames");
-            }
-            #endif
         }
 
-        /// <summary>
-        /// Async wait while predicate returns true
-        /// </summary>
         public static async Task WaitWhile(Func<bool> predicate, CancellationToken ct = default, int maxWaitMs = 30000)
         {
             await WaitUntil(() => !predicate(), ct, maxWaitMs);
         }
 
-        /// <summary>
-        /// Convert Unity AsyncOperation to Task
-        /// </summary>
         public static async Task<T> ToTask<T>(this T operation, CancellationToken ct = default) where T : AsyncOperation
         {
             while (!operation.isDone)
@@ -131,75 +76,39 @@ namespace SomaticLandscapes.Async
             return operation;
         }
 
-        /// <summary>
-        /// Execute action on main Unity thread
-        /// </summary>
         public static async Task RunOnMainThread(Action action, CancellationToken ct = default)
         {
             var tcs = new TaskCompletionSource<bool>();
-            
-            UnityMainThreadDispatcher.Enqueue(() =>
+            GlobalMainThreadDispatcher.Enqueue(() =>
             {
-                try
-                {
-                    ct.ThrowIfCancellationRequested();
-                    action();
-                    tcs.SetResult(true);
-                }
-                catch (Exception ex)
-                {
-                    tcs.SetException(ex);
-                }
+                try { 
+                    ct.ThrowIfCancellationRequested(); 
+                    action(); 
+                    tcs.SetResult(true); 
+                } catch (Exception ex) { tcs.SetException(ex); }
             });
-            
             await tcs.Task;
         }
 
-        /// <summary>
-        /// Execute function on main Unity thread and return result
-        /// </summary>
         public static async Task<T> RunOnMainThread<T>(Func<T> func, CancellationToken ct = default)
         {
             var tcs = new TaskCompletionSource<T>();
-            
-            UnityMainThreadDispatcher.Enqueue(() =>
+            GlobalMainThreadDispatcher.Enqueue(() =>
             {
-                try
-                {
-                    ct.ThrowIfCancellationRequested();
-                    var result = func();
-                    tcs.SetResult(result);
-                }
-                catch (Exception ex)
-                {
-                    tcs.SetException(ex);
-                }
+                try { 
+                    ct.ThrowIfCancellationRequested(); 
+                    tcs.SetResult(func()); 
+                } catch (Exception ex) { tcs.SetException(ex); }
             });
-            
             await tcs.Task;
             return tcs.Task.Result;
         }
-        /// <summary>
-        /// Async wait for EndOfFrame (requires Main Thread Dispatcher)
-        /// CRITICAL: Ensures GPU has finished rendering current frame before proceeding
-        /// </summary>
+
         public static async Task WaitForEndOfFrame(CancellationToken ct = default)
         {
             var tcs = new TaskCompletionSource<bool>();
-            
-            // Check dispatcher
-            if (UnityMainThreadDispatcher.Instance == null)
-            {
-                Debug.LogWarning("WaitForEndOfFrame: Dispatcher missing, falling back to WaitFrames(1)");
-                await WaitFrames(1, ct);
-                return;
-            }
-
-            UnityMainThreadDispatcher.Enqueue(() =>
-            {
-                UnityMainThreadDispatcher.Instance.StartCoroutine(CoWaitForEndOfFrame(tcs, ct));
-            });
-            
+            if (GlobalMainThreadDispatcher.Instance == null) { await WaitFrames(1, ct); return; }
+            GlobalMainThreadDispatcher.Enqueue(() => GlobalMainThreadDispatcher.Instance.StartCoroutine(CoWaitForEndOfFrame(tcs, ct)));
             await tcs.Task;
         }
 
@@ -209,6 +118,52 @@ namespace SomaticLandscapes.Async
             if (ct.IsCancellationRequested) tcs.SetCanceled();
             else tcs.SetResult(true);
         }
-    }
 
+        // =========================================================================================
+        // FADE EXTENSIONS
+        // =========================================================================================
+
+        public static async Task FadeAlpha(this CanvasGroup g, float from, float to, float duration, CancellationToken ct)
+        {
+            if (!g) return;
+            duration = Mathf.Max(0.01f, duration);
+            float t = 0f;
+            g.alpha = from;
+            try 
+            {
+                while (t < duration)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    t += Time.deltaTime;
+                    if (g) g.alpha = Mathf.Lerp(from, to, t / duration);
+                    await Task.Yield();
+                }
+                if (g) g.alpha = to;
+            }
+            catch (OperationCanceledException) 
+            {
+                // Expected if faded out mid-way
+            }
+        }
+
+        public static async Task Crossfade(CanvasGroup a, CanvasGroup b, float toA, float toB, float duration, CancellationToken ct)
+        {
+            duration = Mathf.Max(0.01f, duration);
+            float t = 0f;
+            float startA = a ? a.alpha : 0f;
+            float startB = b ? b.alpha : 0f;
+            
+            while (t < duration)
+            {
+                ct.ThrowIfCancellationRequested();
+                t += Time.deltaTime;
+                float k = Mathf.Clamp01(t / duration);
+                if (a) a.alpha = Mathf.Lerp(startA, toA, k);
+                if (b) b.alpha = Mathf.Lerp(startB, toB, k);
+                await Task.Yield();
+            }
+            if (a) a.alpha = toA;
+            if (b) b.alpha = toB;
+        }
+    }
 }

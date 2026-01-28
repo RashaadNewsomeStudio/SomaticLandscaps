@@ -21,13 +21,8 @@ public class ActiveFlow
     private HashSet<int> _badActive = new HashSet<int>();
     private int _lastActiveIndex = -1;
 
-    // CONCURRENCY FIX: Prevent multiple ActiveSequenceAsync from running simultaneously
-    // This fixes the 3rd-trigger crash where multiple tasks access the same HapPlayer
+    // Concurrency control
     private readonly SemaphoreSlim _activeSequenceLock = new SemaphoreSlim(1, 1);
-    private Task _currentActiveTask = Task.CompletedTask;
-    
-    // PRODUCTION FIX: Session token to invalidate stale continuations
-    // Prevents late tasks from accessing closed/reopened players
     private int _activeSessionId = 0;
 
     public ActiveFlow(ArtworkController ctrl, AsyncAssetManager assetManager, IdleAmbientLoop idle, MusicFlow music, Func<CancellationTokenSource> getActiveCts)
@@ -44,200 +39,107 @@ public class ActiveFlow
     {
         if (value == 1)
         {
-            if (_ctrl.inIdle && !_ctrl.activeRunning)
-            {
-                ControllerMain.LogStep("ReceiveActive(1) => ACTIVE (from idle)");
-                _ctrl.SetActive(true);
-            }
-            else
-            {
-                ControllerMain.LogStep("ReceiveActive(1) ignored — already active or transitioning.");
-            }
+            // Allow re-triggering / restarting even if already running
+            // Allow re-triggering / restarting even if already running
+            ControllerMain.LogInfo("[Active] >>> TRIGGERED (OSC/Button) <<<");
+            _ctrl.SetActive(true);
         }
         else if (value == 0)
         {
-            if (_ctrl.activeRunning)
-            {
-                if (_ctrl.ignoreAmbientWhileActive)
-                {
-                    ControllerMain.LogStep("ReceiveActive(0) ignored — IgnoreAmbientWhileActive=true (non-interruptible Active).");
-                    return;
-                }
-
-                ControllerMain.LogStep("ReceiveActive(0) => AMBIENT (return)");
-                _ctrl.SetActive(false);
-            }
-            else
-            {
-                ControllerMain.LogStep("ReceiveActive(0) ignored — already ambient.");
-            }
-        }
-        else
-        {
-            ControllerMain.LogStep($"ReceiveActive({value}) ignored (unsupported value).");
+            // Force return to idle
+            ControllerMain.LogStep("ReceiveActive(0) => AMBIENT");
+            _ctrl.SetActive(false);
         }
     }
 
     public void TriggerActive(string sourceTag, ref CancellationTokenSource activeCts, CancellationToken globalCt)
     {
+        // IMMEDIATE STATE UPDATE to prevent OSC race conditions
+        _ctrl.activeRunning = true;
+        _ctrl.inIdle = false;
         _ctrl._returnStartWithA = _ctrl.usingA;
         
-        // STABILITY REVERT: Do not cancel Idle Loop aggressively. 
-        // Interupting HAP loading triggers Native Access Violations.
-        // usage of _ctrl.inIdle = false (later) will stop the loop gracefully.
+        if (activeCts != null) { activeCts.Cancel(); activeCts.Dispose(); }
         
-        // CONCURRENCY FIX: Properly manage CTS lifecycle
-        if (activeCts != null) 
-        { 
-            activeCts.Cancel();
-            activeCts.Dispose();
-        }
-        
-        // PRODUCTION FIX: Increment session ID to invalidate any stale continuations
-        // Any late tasks from previous sessions will detect mismatch and abort
         _activeSessionId++;
         int currentSession = _activeSessionId;
         
-        // Create new CTS for this trigger
         activeCts = new CancellationTokenSource();
         var linked = CancellationTokenSource.CreateLinkedTokenSource(globalCt, activeCts.Token);
         
-        // Start new sequence with proper serialization to prevent 3rd-trigger crash
-        // This ensures only ONE ActiveSequenceAsync runs at a time
-        _currentActiveTask = StartActiveSequenceSerializedAsync(sourceTag, currentSession, linked.Token);
+        _ = StartActiveSequenceSerializedAsync(sourceTag, currentSession, linked.Token);
         ControllerMain.LogStep($"Active sequence triggered (source={sourceTag}, session={currentSession}).");
     }
 
-    /// <summary>
-    /// Serializes active sequence execution to prevent concurrent access to shared HapPlayer.
-    /// Fixes the 3rd-trigger crash caused by fire-and-forget async pattern.
-    /// Pattern: Concurrency in C# Cookbook - Chapter 12: Synchronization
-    /// PRODUCTION: Session token prevents stale continuations from accessing closed players
-    /// </summary>
     private async Task StartActiveSequenceSerializedAsync(string sourceTag, int sessionId, CancellationToken ct)
     {
-        // Wait for previous active sequence to complete cleanup
-        // This is the KEY fix: prevents multiple tasks from accessing activeHP simultaneously
         await _activeSequenceLock.WaitAsync(ct);
-        
         try
         {
-            // PRODUCTION: Verify session is still valid (not superseded by newer trigger)
-            if (sessionId != _activeSessionId)
-            {
-                ControllerMain.LogStep($"Active sequence aborted (stale session {sessionId}, current is {_activeSessionId}).");
-                return;
-            }
+            if (sessionId != _activeSessionId) return;
             
-            // Trigger cleanup of idle background tasks (waits for them to finish)
-            // This prevents the "3rd trigger crash" by removing overlap between Idle Prepare and Active Open
             await _idle.StopIdleWorkAsync(ct);
-            // FIX A: Stop idle loop owner (Critical for crossfade safety)
             await _idle.StopIdleLoopOwnedAsync(ct);
 
-            // Run the actual sequence (will release lock when done)
             await ActiveSequenceAsync(sourceTag, sessionId, ct);
         }
-        catch (OperationCanceledException)
-        {
-            ControllerMain.LogStep($"Active sequence cancelled (session={sessionId}).");
-        }
+        catch (OperationCanceledException) { /* Expected on cancel */ }
         catch (Exception ex)
         {
-            ControllerMain.LogError($"Active sequence error (session={sessionId}): {ex.Message}");
+            ControllerMain.LogError($"Active sequence error: {ex.Message}");
         }
         finally
         {
-            // CRITICAL: Always release the lock to allow next trigger
-            // Without this, 2nd trigger would deadlock forever
             _activeSequenceLock.Release();
         }
     }
 
     public void RequestReturnToIdle(ref CancellationTokenSource activeCts, CancellationToken globalCt)
     {
-        if (!_ctrl.activeRunning)
-        {
-            ControllerMain.LogStep("SetActive(false) ignored — already ambient.");
-            return;
-        }
-        ControllerMain.LogStep("SetActive(false) → returning to Ambient.");
-        StartForceReturnToIdle(ref activeCts, globalCt);
+        if (!_ctrl.activeRunning) return;
+        ControllerMain.LogStep("RequestReturnToIdle -> Returning to Ambient.");
+        
+        if (activeCts != null) { activeCts.Cancel(); activeCts.Dispose(); activeCts = null; }
+        _ = ForceReturnToIdleAsync(globalCt);
     }
 
-    private void StartForceReturnToIdle(ref CancellationTokenSource activeCts, CancellationToken globalCt)
+    private async Task PauseIdlePlayersAsync(CancellationToken ct)
     {
-        // Cancel running active sequence
-        if (activeCts != null) { activeCts.Cancel(); activeCts.Dispose(); activeCts = null; }
-        
-        _ = ForceReturnToIdleAsync(globalCt);
+        await AsyncExtensions.RunOnMainThread(() =>
+        {
+            try { if (_ctrl.idleA) _ctrl.idleA.speed = 0f; } catch {}
+            try { if (_ctrl.idleB) _ctrl.idleB.speed = 0f; } catch {}
+        }, ct);
     }
 
     private async Task ActiveSequenceAsync(string sourceTag, int sessionId, CancellationToken ct)
     {
-        _ctrl.activeRunning = true;
-        _ctrl.inIdle = false;
-
         // Fade out idle
         float idleOut = Mathf.Max(0.01f, _ctrl.idleToActiveFadeOut);
         await _ctrl.FadeTwoAsync(_ctrl.idleGA, _ctrl.idleGB, 0f, 0f, idleOut, ct);
 
-        if (_ctrl.activeGroup) _ctrl.activeGroup.alpha = 0f;
+        // Pause idle players to reduce GPU decoder pressure
+        await PauseIdlePlayersAsync(ct);
 
-        // FIX B: RESOURCE CAP (Max 2 Players)
-        // Crash analysis shows 3 players (IdleA + IdleB + Active) causes native instability.
-        // We MUST close the standby idle player before opening Active.
-        HapPlayer standbyHp = _ctrl.usingA ? _ctrl.idleB : _ctrl.idleA;
-        RawImage standbyImg = _ctrl.usingA ? _ctrl.idleImgB : _ctrl.idleImgA;
-        
-        if (standbyHp != null)
-        {
-            ControllerMain.LogStep($"Active Trigger: Releasing standby idle player ({standbyHp.name}) to free resources.");
-            
-            // 1. Detach UI
-            await AsyncExtensions.RunOnMainThread(() =>
-            {
-                if (standbyImg) standbyImg.texture = null;
-                standbyHp.targetTexture = null;
-            }, ct);
-            
-            // 2. GPU Barrier
-            await AsyncExtensions.WaitForEndOfFrame(ct);
-            await AsyncExtensions.WaitFrames(1, ct);
-            
-            // 3. Close & Release
-            await _assetManager.ReleaseVideoAsync(standbyHp, ct);
-        }
+        await ReleaseStandbyPlayerAsync(ct);
 
         if (_ctrl.activeGroup) _ctrl.activeGroup.alpha = 0f;
 
-        // PRODUCTION: Verify session before player access
-        if (sessionId != _activeSessionId)
+        if (sessionId != _activeSessionId) return;
+
+        // Load active video
+        if (!await OpenValidActiveAsync(_ctrl.activeHP, ct))
         {
-            ControllerMain.LogStep($"Active sequence aborted before load (stale session {sessionId}).");
+            await CleanupAndReturnToIdleAsync(sessionId, true, ct); // Treat as forced return on failure
             return;
         }
 
-        // Load active video async
-        bool opened = await OpenValidActiveAsync(_ctrl.activeHP, ct);
-
-        if (!opened)
-        {
-            await _ctrl.FadeTwoAsync(_ctrl.idleGA, _ctrl.idleGB, 1f, 0f, _ctrl.returnFade, ct);
-            _ctrl.activeRunning = false;
-            _ctrl.inIdle = true;
-            _ = _idle.IdleLoopAsync(ct);
-            ControllerMain.LogStep("Active open failed; returning to idle.");
-            return;
-        }
-
-        _ctrl.StartCoroutine(_music.Co_StartMusicAfterDelay(_ctrl.musicRampIn));
+        // Playback
+        _ = _music.StartMusicAfterDelayAsync(_ctrl.musicRampIn, ct);
 
         float fin = Mathf.Max(0.05f, _ctrl.activeFadeIn);
-        ControllerMain.LogStep($"Active fade-in start (dur={fin:0.00}s, session={sessionId})");
         await _ctrl.FadeOneAsync(_ctrl.activeGroup, 0f, 1f, fin, ct);
 
-        // PRODUCTION: Check session after await
         if (sessionId != _activeSessionId) return;
 
         float dur  = Mathf.Max(0.2f, (float)_ctrl.activeHP.streamDuration);
@@ -247,124 +149,144 @@ public class ActiveFlow
             ? Mathf.Min(fin + Mathf.Max(0f, _ctrl.activeFixedMidHoldSeconds), Mathf.Max(0f, dur - fout))
             : Mathf.Max(0f, Mathf.Max(dur - fout, fin <= dur ? fin : dur * 0.5f));
 
-        ControllerMain.LogStep($"Active fade-out start scheduled at t={fadeOutStart:0.00}s (dur={fout:0.00}s, total={dur:0.00}s)");
-
         try
         {
             await AsyncExtensions.WaitUntil(() => _ctrl.activeHP != null && _ctrl.activeHP.time >= fadeOutStart, ct);
         }
         catch (OperationCanceledException) {}
 
-        // PRODUCTION: Check session after long wait
-        if (sessionId != _activeSessionId)
-        {
-            ControllerMain.LogStep($"Active sequence aborted after playback (stale session {sessionId}).");
-            return;
-        }
+        if (sessionId != _activeSessionId) return;
 
-        _ctrl.StartCoroutine(_music.RampDownToZero(Mathf.Max(0.01f, _ctrl.musicRampOut)));
-
-        await _ctrl.FadeOneAsync(_ctrl.activeGroup, 1f, 0f, fout, ct);
-
-        if (!_ctrl.activeUseFixedWindow && _ctrl.activeEndHoldSeconds > 0f)
-            await AsyncExtensions.WaitForSeconds(_ctrl.activeEndHoldSeconds, ct);
-
-        _ctrl.usingA = _ctrl._returnStartWithA;
-
-        var gStart = _ctrl.usingA ? _ctrl.idleGA : _ctrl.idleGB;
-
-        if (_ctrl.randomizeIdleStartOnReturn)
-        {
-            // Memory management note: Unity 6 has incremental GC enabled by default.
-            // Manual GC.Collect() causes 100-500ms frame hitches and is counterproductive.
-            // Removed aggressive GC calls - let Unity's automatic GC handle cleanup.
-            
-            var hp = _ctrl.usingA ? _ctrl.idleA : _ctrl.idleB;
-            // Load required idle side async 
-            await _idle.PrepareIdleForSideAsync(hp, _ctrl.usingA, ct, force: true);
-        }
-
-        // PRODUCTION: Final session check before player Close
-        if (sessionId != _activeSessionId)
-        {
-            ControllerMain.LogStep($"Active sequence aborted before cleanup (stale session {sessionId}).");
-            return;
-        }
-
-        // NATIVE CRASH FIX: Use manager's safe release which includes GPU barriers
-        // We pass a callback to detach the RawImage (consumer) inside the safety zone
-        if (_ctrl.activeHP != null)
-        {
-            try 
-            { 
-                await _assetManager.ReleaseVideoAsync(_ctrl.activeHP, ct, () => 
-                {
-                    if (_ctrl.activeImg != null) _ctrl.activeImg.texture = null;
-                });
-                
-                ControllerMain.LogStep($"Active player released safely (GPU-synchronized, session={sessionId}).");
-            }
-            catch (Exception ex) 
-            { 
-                ControllerMain.LogWarn($"Error releasing active player: {ex.Message}"); 
-            }
-        }
-
-        if (_ctrl.returnBlackHold > 0f) await AsyncExtensions.WaitForSecondsRealtime(_ctrl.returnBlackHold, ct);
-        if (gStart) await _ctrl.FadeOneAsync(gStart, 0f, 1f, Mathf.Max(0.05f, _ctrl.returnFade), ct);
-
-        _ctrl._returnStartIsA = _ctrl.usingA;
-        _ctrl._idlePrimedFromReturn = true;
-
-        _ctrl.activeRunning = false;
-        _ctrl.inIdle = true;
-        _ = _idle.IdleLoopAsync(ct);
-
-        ControllerMain.LogStep($"Returned to idle (session={sessionId}).");
+        await CleanupAndReturnToIdleAsync(sessionId, false, ct);
     }
 
     private async Task ForceReturnToIdleAsync(CancellationToken ct)
     {
-        _ctrl.StartCoroutine(_music.RampDownToZero(Mathf.Max(0.01f, _ctrl.musicRampOut)));
+        await CleanupAndReturnToIdleAsync(_activeSessionId, true, ct);
+    }
 
-        float fout = Mathf.Max(0.05f, _ctrl.activeFadeOut);
-        float currentAlpha = _ctrl.activeGroup ? _ctrl.activeGroup.alpha : 0f;
-
-        if (_ctrl.activeGroup) await _ctrl.FadeOneAsync(_ctrl.activeGroup, currentAlpha, 0f, fout, ct);
-
-        _ctrl.usingA = _ctrl._returnStartWithA;
-
-        var gStart = _ctrl.usingA ? _ctrl.idleGA : _ctrl.idleGB;
-
-        // NATIVE CRASH FIX: Safe release with consumer detach
-        if (_ctrl.activeHP != null)
+    private async Task CleanupAndReturnToIdleAsync(int sessionId, bool isForced, CancellationToken ct)
+    {
+        try
         {
-            try 
-            { 
+            // 1. Fade out Active & Music
+            var musicTask = _music.RampDownToZeroAsync(Mathf.Max(0.01f, _ctrl.musicRampOut), ct);
+            
+            float fout = Mathf.Max(0.05f, _ctrl.activeFadeOut);
+            if (_ctrl.activeGroup && _ctrl.activeGroup.alpha > 0f)
+                await _ctrl.FadeOneAsync(_ctrl.activeGroup, _ctrl.activeGroup.alpha, 0f, fout, ct);
+            
+            await musicTask;
+
+            if (!_ctrl.activeUseFixedWindow && !isForced && _ctrl.activeEndHoldSeconds > 0f)
+                await AsyncExtensions.WaitForSeconds(_ctrl.activeEndHoldSeconds, ct);
+
+            if (!isForced && sessionId != _activeSessionId) return;
+
+            // 2. Release Active Player safely
+            if (_ctrl.activeHP != null)
+            {
                 await _assetManager.ReleaseVideoAsync(_ctrl.activeHP, ct, () => 
                 {
                     if (_ctrl.activeImg != null) _ctrl.activeImg.texture = null;
                 });
-                
-                ControllerMain.LogStep("Active player released safely (forced return, GPU-synchronized).");
+            }
+
+            // 3. Prepare FRESH Idle Content (CRITICAL: Load BEFORE fading in)
+            // This ensures we fade in fresh content, not stale old idle videos
+            _ctrl.usingA = _ctrl._returnStartWithA;
+            
+            // Ensure both idle players are at 0 alpha while we load fresh content
+            await AsyncExtensions.RunOnMainThread(() =>
+            {
+                if (_ctrl.idleGA) _ctrl.idleGA.alpha = 0f;
+                if (_ctrl.idleGB) _ctrl.idleGB.alpha = 0f;
+            }, ct);
+
+            // Load fresh content on the primary player (what we'll fade in)
+            var primaryPlayer = _ctrl.usingA ? _ctrl.idleA : _ctrl.idleB;
+            try 
+            { 
+                await _idle.PrepareIdleForSideAsync(primaryPlayer, _ctrl.usingA, ct, force: true);
+                ControllerMain.LogInfo($"[Return] Prepared fresh idle for {(_ctrl.usingA ? "A" : "B")}");
             }
             catch (Exception ex) 
             { 
-                ControllerMain.LogWarn($"Error releasing active player: {ex.Message}"); 
+                ControllerMain.LogError($"Error prepping idle return: {ex.Message}"); 
             }
+
+            // Load the standby player in parallel (so it's ready for the loop)
+            var standbyPlayer = _ctrl.usingA ? _ctrl.idleB : _ctrl.idleA;
+            _ = _idle.PrepareIdleForSideAsync(standbyPlayer, !_ctrl.usingA, ct, force: true);
+
+            // 4. Black hold BEFORE fade in
+            if (_ctrl.returnBlackHold > 0f) 
+                await AsyncExtensions.WaitForSecondsRealtime(_ctrl.returnBlackHold, ct);
+            
+            // 5. Fade in the FRESH idle content (not old stale content)
+            var gStart = _ctrl.usingA ? _ctrl.idleGA : _ctrl.idleGB;
+            if (gStart) 
+                await _ctrl.FadeOneAsync(gStart, 0f, 1f, Mathf.Max(0.05f, _ctrl.returnFade), ct);
+
+            // 6. Start Idle Loop (it will use the already-prepared content)
+            if (sessionId == _activeSessionId)
+            {
+                _ctrl.activeRunning = false;
+                _ctrl.inIdle = true;
+                if (_ctrl.activeTrigger) _ctrl.activeTrigger.SetInteractable(true);
+                ControllerMain.LogInfo($"State reset (Session {sessionId}): inIdle=true, activeRunning=false");
+            }
+            
+            // Signal that idle is already primed (skip re-load in StartIdleNowAsync)
+            _ctrl._returnStartIsA = _ctrl.usingA;
+            _ctrl._idlePrimedFromReturn = true;
+            
+            // Start the loop (it will see _idlePrimedFromReturn and skip re-prep)
+            _ = _idle.StartIdleLoopOwnedAsync(ct);
+            
+            ControllerMain.LogStep(isForced ? "Forced return to idle complete." : $"Active complete (session={sessionId}). Returned to idle.");
         }
+        catch (OperationCanceledException)
+        {
+            ControllerMain.LogStep("CleanupAndReturnToIdle cancelled (new session started?).");
+        }
+        catch (Exception ex)
+        {
+            ControllerMain.LogError($"CleanupAndReturnToIdle CRASHED: {ex.Message}\n{ex.StackTrace}");
+            // Attempt to restart idle anyway if we crashed
+             _ = _idle.StartIdleNowAsync(ct);
+        }
+        finally
+        {
+            // Only reset state if we are the LATEST session. 
+            if (sessionId == _activeSessionId)
+            {
+                _ctrl.activeRunning = false;
+                _ctrl.inIdle = true;
+                if (_ctrl.activeTrigger) _ctrl.activeTrigger.SetInteractable(true);
+                ControllerMain.LogInfo($"State reset (Session {sessionId}): inIdle=true, activeRunning=false");
+            }
+            ControllerMain.LogInfo($"Cleanup finished for Session {sessionId}. Current is {_activeSessionId}.");
+        }
+    }
 
-        if (_ctrl.returnBlackHold > 0f) await AsyncExtensions.WaitForSecondsRealtime(_ctrl.returnBlackHold, ct);
-        if (gStart) await _ctrl.FadeOneAsync(gStart, 0f, 1f, Mathf.Max(0.05f, _ctrl.returnFade), ct);
-
-        _ctrl._returnStartIsA = _ctrl.usingA;
-        _ctrl._idlePrimedFromReturn = true;
-
-        _ctrl.activeRunning = false;
-        _ctrl.inIdle = true;
-        _ = _idle.IdleLoopAsync(ct);
-
-        ControllerMain.LogStep("External cancel: returned to idle.");
+    private async Task ReleaseStandbyPlayerAsync(CancellationToken ct)
+    {
+        HapPlayer standbyHp = _ctrl.usingA ? _ctrl.idleB : _ctrl.idleA;
+        RawImage standbyImg = _ctrl.usingA ? _ctrl.idleImgB : _ctrl.idleImgA;
+        
+        if (standbyHp != null)
+        {
+            await AsyncExtensions.RunOnMainThread(() =>
+            {
+                if (standbyImg) standbyImg.texture = null;
+                standbyHp.targetTexture = null;
+            }, ct);
+            
+            await AsyncExtensions.WaitForEndOfFrame(ct);
+            await AsyncExtensions.WaitFrames(1, ct);
+            await _assetManager.ReleaseVideoAsync(standbyHp, ct);
+        }
     }
 
     private async Task<bool> OpenValidActiveAsync(HapPlayer hp, CancellationToken ct)
@@ -374,55 +296,23 @@ public class ActiveFlow
         int tries = 0;
         while (tries++ < Mathf.Max(1, _ctrl.hapMaxAttemptsPerPick) && !ct.IsCancellationRequested)
         {
-            int newLast;
-            int idx = CyclePicker.NextFromCycleFiltered(_cycleActive, _ctrl.activeList.Length, _lastActiveIndex, _badActive, out newLast);
+            int idx = CyclePicker.NextFromCycleFiltered(_cycleActive, _ctrl.activeList.Length, _lastActiveIndex, _badActive, out int newLast);
             _lastActiveIndex = newLast;
 
             if (idx >= 0 && idx < _ctrl.activeList.Length)
             {
                 string rel = ArtworkController.GetRel(_ctrl.activeList[idx]);
-                if (!string.IsNullOrEmpty(rel))
-                {
-                    string file = Path.GetFileName(rel);
-                    ControllerMain.LogStep($"Active pick attempt: '{file}'");
-
-                    string fullPath = _media.ResolveLoadPath(rel, true);
-
-                    // UNIFIED CALL: Use shared loader
-                    bool ok = await _assetManager.LoadAndAssignVideoAsync(
-                        fullPath, 
-                        hp, 
-                        _ctrl._cfgW, 
-                        _ctrl._cfgH, 
-                        "Active",
-                        _ctrl.activeRT,    // Priority: Manual RT
-                        _ctrl.activeImg,   // Target UI
-                        false,             // loop (Active is oneshot)
-                        ct,
-                        (rt) => _ctrl.activeRT = rt
-                    );
-                    
-                    if (ok) return true;
-
-                    ControllerMain.LogWarn($"Active open failed: {file}");
-                    _badActive.Add(idx);
-                }
+                string fullPath = _media.ResolveLoadPath(rel, true);
+                
+                if (await _assetManager.LoadAndAssignVideoAsync(fullPath, hp, _ctrl._cfgW, _ctrl._cfgH, "Active", _ctrl.activeRT, _ctrl.activeImg, false, ct, (rt) => _ctrl.activeRT = rt))
+                    return true;
+                
+                _badActive.Add(idx);
             }
-            
             await AsyncExtensions.WaitForSeconds(0.2f, ct);
         }
-
-        ControllerMain.LogError("Active open GAVE UP after multiple tries.");
         return false;
     }
 
-    private bool HasActivePaths() => ArtworkController.HasAnyValid(_ctrl.activeList);
-
-    /// <summary>
-    /// Cleanup method to prevent resource leaks. Call this when ActiveFlow is no longer needed.
-    /// </summary>
-    public void Cleanup()
-    {
-        _activeSequenceLock?.Dispose();
-    }
+    public void Cleanup() => _activeSequenceLock?.Dispose();
 }
