@@ -13,11 +13,8 @@ public class IdleAmbientLoop
     private readonly AsyncAssetManager _assetManager;
     private readonly MediaDiscoveryService _media;
 
-    // Randomization State
     private List<int> _cycleIdleA = new List<int>(), _cycleIdleB = new List<int>(), _cycleIdleShared = new List<int>();
     private HashSet<int> _badIdleA = new HashSet<int>(), _badIdleB = new HashSet<int>(), _badIdleShared = new HashSet<int>();
-    
-    // Failure/Retry State
     private int _lastAttemptedIdleA = -1, _lastAttemptedIdleB = -1;
     private int _failureCountIdleA = 0, _failureCountIdleB = 0;
     private Dictionary<int, int> _quarantineIdleA = new Dictionary<int, int>(), _quarantineIdleB = new Dictionary<int, int>(), _quarantineIdleShared = new Dictionary<int, int>();
@@ -25,11 +22,9 @@ public class IdleAmbientLoop
     private bool _isPreparingA, _isPreparingB;
     private volatile bool _stopIdleWork;
 
-    // Async State
     private CancellationTokenSource _prepA, _prepB, _idleCts;
-    private CancellationToken _idleRootToken = CancellationToken.None; // Root lifetime token (not loop token)
+    private CancellationToken _idleRootToken = CancellationToken.None; // CRITICAL: Root lifetime token (not loop token)
     private Task _prepTaskA = Task.CompletedTask, _prepTaskB = Task.CompletedTask, _idleTask = Task.CompletedTask;
-    // State for Logging
     private string _loadedPathA, _loadedPathB;
 
     public IdleAmbientLoop(ArtworkController ctrl, AsyncAssetManager assetManager)
@@ -39,9 +34,7 @@ public class IdleAmbientLoop
         _media = new MediaDiscoveryService(ctrl, assetManager); 
     }
 
-    // ==========================================
-    // LIFECYCLE
-    // ==========================================
+
 
     public async Task StartIdleNowAsync(CancellationToken ct)
     {
@@ -51,14 +44,11 @@ public class IdleAmbientLoop
         _ctrl.inIdle = _ctrl.usingA = true;
         _stopIdleWork = false;
 
-        // Load sequentially (A then B)
         await PrepareIdleForSideAsync(_ctrl.idleA, true, ct);
         await Task.Yield();
         await PrepareIdleForSideAsync(_ctrl.idleB, false, ct);
 
         SetAlphas(1f, 0f);
-        
-        // Log Initial Status
         string initialName = !string.IsNullOrEmpty(_loadedPathA) ? Path.GetFileName(_loadedPathA) : "Loading...";
         ControllerMain.LogInfo($"[Idle] LIVE: '{initialName}' (Initial)");
         
@@ -106,9 +96,7 @@ public class IdleAmbientLoop
             ControllerMain.LogWarn($"{context} did not finish in time.");
     }
 
-    // ==========================================
-    // MAIN LOOP
-    // ==========================================
+
 
     private void PausePlayer(HapPlayer hp)
     {
@@ -126,12 +114,11 @@ public class IdleAmbientLoop
     {
         try
         {
-            _stopIdleWork = false; // Ensure we are allowed to run
+            _stopIdleWork = false;
             if (!HasIdlePaths(true) && !HasIdlePaths(false)) return;
 
             if (_ctrl._idlePrimedFromReturn)
             {
-                // Content already prepared in return-to-idle flow
                 _ctrl.usingA = _ctrl._returnStartIsA;
                 SetAlphas(_ctrl.usingA ? 1f : 0f, _ctrl.usingA ? 0f : 1f);
                 _ctrl._idlePrimedFromReturn = false;
@@ -139,7 +126,6 @@ public class IdleAmbientLoop
             }
             else if (!_ctrl.crossfadeIdle)
             {
-                // Initial startup with no crossfade: prepare A
                 await PrepareIdleForSideAsync(_ctrl.idleA, true, ct);
                 SetAlphas(1f, 0f);
             }
@@ -155,17 +141,13 @@ public class IdleAmbientLoop
                 float tFadeStart = Mathf.Max(0f, len - targetFade);
 
 #if UNITY_EDITOR || DEVELOPMENT_BUILD
-                // Debug Timing (dev builds only - prevents log spam in production)
                  ControllerMain.LogInfo(
                   $"[IdleTiming] usingA={_ctrl.usingA} len={len:F2} time={(active!=null?(float)active.time:-1f):F2} " +
                   $"tPrepare={tPrepare:F2} tFadeStart={tFadeStart:F2} fade={targetFade:F2}");
 #endif
 
-                // FIX 2: Better WaitUntil Logic (Wall-clock timeout)
                 float startWait = Time.realtimeSinceStartup;
-                float waitMax = len + 1.5f; // reduced buffer slightly
-
-                // 1. Wait until Prepare Time
+                float waitMax = len + 1.5f;
                 await AsyncExtensions.WaitUntil(() => 
                 {
                     float elapsed = Time.realtimeSinceStartup - startWait;
@@ -175,10 +157,7 @@ public class IdleAmbientLoop
                 }, ct);
                 if (ShouldStop()) break;
 
-                // 2. Prepare Standby (Async)
                 await StartPrepareAsync(standby, !_ctrl.usingA, ct);
-                
-                // Single-decoder mode: keep standby paused until swap
                 if (!_ctrl.crossfadeIdle)
                 {
                     PausePlayer(standby);
@@ -188,22 +167,14 @@ public class IdleAmbientLoop
 
                 if (_ctrl.usingA) { if (_ctrl.idleGB) _ctrl.idleGB.alpha = 0f; } 
                 else              { if (_ctrl.idleGA) _ctrl.idleGA.alpha = 0f; }
-
-                // 3. Wait until Fade Start
-                // Reuse startWait? No, because tFadeStart is relative to video start. 
-                // BUT our elapsed is relative to *loop iteration start* ~ video start.
-                // So we can check if (Time.realtimeSinceStartup - startWait > tFadeStart) etc.
-                // Better: just check active.time again with same wall-clock guard.
                 await AsyncExtensions.WaitUntil(() => 
                 {
                     float elapsed = Time.realtimeSinceStartup - startWait;
                     return ShouldStop() 
                            || (active != null && active.isValid && active.time >= tFadeStart) 
-                           || elapsed > waitMax; // Same max guard
+                           || elapsed > waitMax;
                 }, ct);
                 if (ShouldStop()) break;
-
-                // 4. Crossfade or Hard Cut
                 float rem = Mathf.Max(0.01f, len - (active != null ? (float)active.time : 0f));
                 float dur = Mathf.Min(targetFade, rem);
                 
@@ -213,17 +184,13 @@ public class IdleAmbientLoop
                 }
                 else
                 {
-                    // Single-decoder mode: stop active, start standby
                     PausePlayer(active);
                     StartPlayerFromZero(standby);
                     SetAlphas(_ctrl.usingA ? 0f : 1f, _ctrl.usingA ? 1f : 0f);
                 }
 
-                // 5. Swap
                 _ctrl.usingA = !_ctrl.usingA;
-                if (!_ctrl.crossfadeIdle) SetAlphas(_ctrl.usingA ? 1f : 0f, _ctrl.usingA ? 0f : 1f); // Ensure final state
-                
-                // Log Status
+                if (!_ctrl.crossfadeIdle) SetAlphas(_ctrl.usingA ? 1f : 0f, _ctrl.usingA ? 0f : 1f);
                 string nameA = !string.IsNullOrEmpty(_loadedPathA) ? Path.GetFileName(_loadedPathA) : "Loading...";
                 string nameB = !string.IsNullOrEmpty(_loadedPathB) ? Path.GetFileName(_loadedPathB) : "Loading...";
                 
@@ -232,15 +199,11 @@ public class IdleAmbientLoop
                 ControllerMain.LogStep("Idle crossfade complete.");
             }
         }
-        catch (OperationCanceledException)
-        {
-            // Expected cancellation
-        }
+        catch (OperationCanceledException) { }
         catch (Exception ex)
         {
             ControllerMain.LogError($"[Idle] Loop crashed: {ex.Message}\n{ex.StackTrace}");
 
-            // Auto-recover if we should still be running
             // CRITICAL: Use _idleRootToken (not ct) to avoid self-cancellation
             if (!ShouldStop() && !_idleRootToken.IsCancellationRequested)
             {
@@ -252,7 +215,7 @@ public class IdleAmbientLoop
                 }
                 
                 await AsyncExtensions.WaitForSecondsRealtime(0.5f, _idleRootToken);
-                _ = StartIdleLoopOwnedAsync(_idleRootToken); // Restart with root token
+                _ = StartIdleLoopOwnedAsync(_idleRootToken);
             }
         }
     }
@@ -261,9 +224,7 @@ public class IdleAmbientLoop
     private void SetAlphas(float a, float b) { if (_ctrl.idleGA) _ctrl.idleGA.alpha = a; if (_ctrl.idleGB) _ctrl.idleGB.alpha = b; }
     private float ValidDuration(HapPlayer hp) => (hp != null && hp.isValid) ? Mathf.Max(0.2f, (float)hp.streamDuration) : 5f;
 
-    // ==========================================
-    // PREPARATION & RETRY LOGIC
-    // ==========================================
+
 
     private Task StartPrepareAsync(HapPlayer hp, bool forA, CancellationToken idleCt)
     {
@@ -286,8 +247,6 @@ public class IdleAmbientLoop
             for (int tries = 0; tries < maxAttempts; tries++)
             {
                 if ((!force && ShouldStop()) || ct.IsCancellationRequested) return;
-
-                // Pick next file (or retry previous)
                 if (!TryPickOrRetry(forA, maxAttempts, out var pool, out int idx, out var badSet))
                 {
                     ControllerMain.LogWarn($"Idle prepare {(forA ? "A" : "B")}: No valid files or selection failed");
@@ -298,8 +257,6 @@ public class IdleAmbientLoop
                 ControllerMain.LogInfo($"[Idle] NEXT: '{Path.GetFileName(rel)}' (Loading...)");
 
                 if (!force && ShouldStop()) return;
-
-                // Attempt Load
                 string fullPath = _media.ResolveLoadPath(rel, false);
                 bool ok = await _assetManager.LoadAndAssignVideoAsync(
                     fullPath, hp, _ctrl._cfgW, _ctrl._cfgH, forA ? "IdleA" : "IdleB",
@@ -312,10 +269,8 @@ public class IdleAmbientLoop
                 {
                     if (forA) _loadedPathA = fullPath; else _loadedPathB = fullPath;
                     ResetFailureState(forA);
-                    return; // Success
+                    return;
                 }
-
-                // Handle Failure
                 HandleFailure(forA, idx, badSet, pool.Length, rel);
                 await AsyncExtensions.WaitForSeconds(_ctrl.hapRetryDelay, ct);
             }
@@ -327,15 +282,11 @@ public class IdleAmbientLoop
         }
     }
 
-    // --- Accessors for state encapsulation ---
-
     private bool TryPickOrRetry(bool forA, int maxAttempts, out ArtworkController.StreamingAssetRef[] pool, out int idx, out HashSet<int> badSet)
     {
         int attemptIdx = forA ? _lastAttemptedIdleA : _lastAttemptedIdleB;
         int failures = forA ? _failureCountIdleA : _failureCountIdleB;
         var quarantine = forA ? _quarantineIdleA : _quarantineIdleB;
-
-        // Determine correct pool and state set
         pool = forA ? (_ctrl.idleAList?.Length>0 ? _ctrl.idleAList : _ctrl.idleShared) : (_ctrl.idleBList?.Length>0 ? _ctrl.idleBList : _ctrl.idleShared);
         if (pool == null || pool.Length == 0) { 
             ControllerMain.LogWarn($"Idle Pool {(forA?"A":"B")} is empty/null!");
@@ -344,27 +295,19 @@ public class IdleAmbientLoop
         
         var cycle = (pool == _ctrl.idleShared) ? _cycleIdleShared : (forA ? _cycleIdleA : _cycleIdleB);
         badSet = (pool == _ctrl.idleShared) ? _badIdleShared : (forA ? _badIdleA : _badIdleB);
-
-        // Logic: If no pending retry, Pick new. Else reuse 'attemptIdx'.
         if (attemptIdx < 0 || failures >= maxAttempts)
         {
              int newLast;
              idx = CyclePicker.NextFromCycleFiltered(cycle, pool.Length, forA ? _ctrl.lastIdleIndexA : _ctrl.lastIdleIndexB, badSet, out newLast);
-             
-             // Update State
              if (pool == _ctrl.idleShared) { _cycleIdleShared = cycle; if (forA) _ctrl.lastIdleIndexA = newLast; else _ctrl.lastIdleIndexB = newLast; }
              else if (forA) { _cycleIdleA = cycle; _ctrl.lastIdleIndexA = newLast; }
              else           { _cycleIdleB = cycle; _ctrl.lastIdleIndexB = newLast; }
 
              if (idx < 0) return false;
-             
-             // Check Quarantine
              if (quarantine.ContainsKey(idx)) {
                  badSet.Add(idx); 
-                 return false; // Skip this try
+                 return false;
              }
-             
-             // Setup for new attempt
              if (forA) { _lastAttemptedIdleA = idx; _failureCountIdleA = 0; }
              else      { _lastAttemptedIdleB = idx; _failureCountIdleB = 0; }
              
@@ -372,7 +315,6 @@ public class IdleAmbientLoop
         }
         else
         {
-             idx = attemptIdx; // Retry same
              ControllerMain.LogInfo($"[IdlePick] Side={(forA?"A":"B")} RETRYING Idx={idx} Failures={failures}");
         }
         return true;
@@ -388,8 +330,6 @@ public class IdleAmbientLoop
             q[idx] = fails;
             badSet.Add(idx);
             ControllerMain.LogWarn($"Quarantined '{Path.GetFileName(relName)}' after {fails} failures");
-            
-            // Reset for next fresh pick
             if (forA) { _lastAttemptedIdleA = -1; _failureCountIdleA = 0; }
             else      { _lastAttemptedIdleB = -1; _failureCountIdleB = 0; }
         }
