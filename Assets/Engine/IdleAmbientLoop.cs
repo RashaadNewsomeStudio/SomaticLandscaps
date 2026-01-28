@@ -58,6 +58,9 @@ public class IdleAmbientLoop
 
     public Task StartIdleLoopOwnedAsync(CancellationToken globalCt)
     {
+        // FIX 3: Reset stop flag so idle can restart
+        _stopIdleWork = false;
+
         // CRITICAL: Store root token FIRST before cancelling old loop token
         // This allows crash recovery to restart using the root token, not the cancelled loop token
         _idleRootToken = globalCt;
@@ -72,13 +75,21 @@ public class IdleAmbientLoop
     {
         _stopIdleWork = true;
         try { _idleCts?.Cancel(); } catch { }
-        await AwaitTaskSafely(_idleTask, 2000, ct, "IdleLoop");
+        
+        // FIX: Await termination robustly to prevent overlap
+        if (_idleTask != null && !_idleTask.IsCompleted)
+        {
+            await AwaitTaskSafely(_idleTask, 3000, ct, "IdleLoop");
+        }
     }
 
     public async Task StopIdleLoopOwnedAsync(CancellationToken ct)
     {
         _idleCts?.Cancel();
-        await AwaitTaskSafely(_idleTask, 1500, ct, "IdleLoopOwned");
+        if (_idleTask != null && !_idleTask.IsCompleted)
+        {
+            await AwaitTaskSafely(_idleTask, 2000, ct, "IdleLoopOwned");
+        }
     }
 
     public async Task StopIdleWorkAsync(CancellationToken ct)
@@ -315,6 +326,7 @@ public class IdleAmbientLoop
         }
         else
         {
+             idx = attemptIdx; // Valid retry of previous index
              ControllerMain.LogInfo($"[IdlePick] Side={(forA?"A":"B")} RETRYING Idx={idx} Failures={failures}");
         }
         return true;

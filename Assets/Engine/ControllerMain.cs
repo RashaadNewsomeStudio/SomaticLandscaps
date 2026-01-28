@@ -168,6 +168,10 @@ public class ControllerMain : MonoBehaviour
         _configDir = Path.Combine(_baseRoot, "Config");
         _logsDir   = Path.Combine(_baseRoot, "Logs");
         _configPath = Path.Combine(_configDir, "ControllerMain.json");
+        
+        Debug.Log($"[ControllerMain] PATH DEBUG: dataPath='{Application.dataPath}'");
+        Debug.Log($"[ControllerMain] PATH DEBUG: _baseRoot='{_baseRoot}'");
+        Debug.Log($"[ControllerMain] PATH DEBUG: _configDir='{_configDir}'");
     }
 
     private string GetCmdArg(string name)

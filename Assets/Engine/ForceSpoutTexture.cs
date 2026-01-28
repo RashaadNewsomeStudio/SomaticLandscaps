@@ -187,4 +187,9 @@ public class ForceSpoutTexture : MonoBehaviour
             Destroy(spoutRT);
         }
     }
+
+    public void PauseOutput(bool paused)
+    {
+        if (sender != null) sender.Paused = paused;
+    }
 }

@@ -40,9 +40,18 @@ public class ActiveTriggerButton : MonoBehaviour
 
         // Log for verification
         //Debug.Log("[ActiveTriggerButton] Clicked! Requesting Active Mode...");
-        ControllerMain.LogInfo("[ActiveTriggerButton] Clicked! Requesting Active Mode...");
+        ControllerMain.LogInfo("[ActiveTriggerButton] Clicked! Processing...");
 
-        // Always allow trigger (it will restart/interrupt if running)
-        _ctrl.SetActive(true);
+        // FIX: Active Click Cancels To Ambient (Full JSON Config Support)
+        if (_ctrl.activeRunning && _ctrl.activeClickCancelsToAmbient)
+        {
+             ControllerMain.LogInfo("[ActiveTriggerButton] Clicked while active + cancel rule => returning to IDLE.");
+             _ctrl.SetActive(false); // Request return to idle safely
+        }
+        else
+        {
+             ControllerMain.LogInfo("[ActiveTriggerButton] Requesting Active Mode...");
+             _ctrl.SetActive(true);
+        }
     }
 }

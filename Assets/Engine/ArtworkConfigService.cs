@@ -57,11 +57,11 @@ using UnityEngine;
             _ctrl = ctrl;
         }
 
-        public void TryLoadAndApply()
+        public void TryLoadAndApply(bool force = false)
         {
             if (TryLoadArtworkConfig(out var cfg)) 
             {
-                ApplyArtworkConfig(cfg);
+                ApplyArtworkConfig(cfg, force);
             }
         }
 
@@ -93,9 +93,19 @@ using UnityEngine;
             return false;
         }
 
-        private void ApplyArtworkConfig(ArtworkConfigData c)
+        private void ApplyArtworkConfig(ArtworkConfigData c, bool force)
         {
             if (c == null) return;
+
+            // FIX 4: ProFix3 Safety Guard
+            // Block hot-reloading if system is running or native video ops are busy
+            // UNLESS force is true (startup)
+            bool isBusy = SomaticLandscapes.Async.AsyncAssetManager.IsBusy;
+            if (!force && Application.isPlaying && (_ctrl.inIdle || _ctrl.activeRunning || isBusy))
+            {
+                ControllerMain.LogWarn($"[ArtworkConfig] BLOCKED: Cannot apply config while system is running (Idle={_ctrl.inIdle} Active={_ctrl.activeRunning} Busy={isBusy}). STOP system first.");
+                return;
+            }
 
             // Update local config vars (if we decide to keep them in controller for now, we set them here)
             // But better to just set the controller's public properties if they exist, or fields if they are internal.
@@ -144,6 +154,7 @@ using UnityEngine;
 
             // Apply behavior toggle from JSON
             _ctrl.ignoreAmbientWhileActive   = c.IgnoreAmbientWhileActive;
+            _ctrl.activeClickCancelsToAmbient = c.ActiveClickCancelsToAmbient;
             
             // OSC Control: Block return-to-idle commands
             var oscController = UnityEngine.Object.FindFirstObjectByType<ArtworkModeController>();

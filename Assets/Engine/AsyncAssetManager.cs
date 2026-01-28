@@ -7,6 +7,7 @@ using System.Threading.Tasks;
 using UnityEngine; 
 using UnityEngine.Networking; 
 using Klak.Hap; 
+using Klak.Spout; 
 
 namespace SomaticLandscapes.Async 
 {
@@ -31,8 +32,21 @@ namespace SomaticLandscapes.Async
         private readonly Dictionary<HapPlayer, SemaphoreSlim> _playerLocks = new Dictionary<HapPlayer, SemaphoreSlim>();
         private readonly object _playerLocksLock = new object();
         
-        // Global Gate
+        // Global Gate & Spout Control
+        // Global Gate & Spout Control
         private static readonly SemaphoreSlim _hapNativeGate = new SemaphoreSlim(1, 1);
+        private SpoutSender _cachedSpoutSender;
+
+        public static bool IsBusy => Instance != null && 
+            (_hapNativeGate.CurrentCount == 0 || 
+             Instance._videoLoadSemaphore.CurrentCount < Instance.maxConcurrentVideoLoads || 
+             Instance._activeLoads.Count > 0);
+
+        private SpoutSender GetSpoutSender() 
+        { 
+            if (_cachedSpoutSender == null) _cachedSpoutSender = FindFirstObjectByType<SpoutSender>(); 
+            return _cachedSpoutSender; 
+        }
 
         void Awake()
         {
@@ -197,13 +211,11 @@ namespace SomaticLandscapes.Async
 #if UNITY_EDITOR || DEVELOPMENT_BUILD
                         LogWarning($"First load attempt failed for {Path.GetFileName(path)}, retrying once...");
 #endif
-                        await _hapNativeGate.WaitAsync(cts.Token);
-                        try
-                        {
+                        // FIX 1 & 2: Use Native Gate wrapper for retry close
+                        await ExecuteNativeOpAsync(async () => {
                             await AsyncExtensions.RunOnMainThread(() => { try { player.Close(); } catch {} }, cts.Token);
                             await AsyncExtensions.WaitForSecondsRealtime(0.2f, cts.Token);
-                        }
-                        finally { _hapNativeGate.Release(); }
+                        }, cts.Token);
 
                         bool secondTrySuccess = await AttemptOpenAndValidateAsync(player, path, cts.Token, onDetach, onSuccess);
                         
@@ -237,43 +249,46 @@ namespace SomaticLandscapes.Async
         /// <summary>
         /// Single open-validate attempt with strict handshake
         /// </summary>
+        /// <summary>
+        /// Single open-validate attempt with strict handshake
+        /// </summary>
         private async Task<bool> AttemptOpenAndValidateAsync(HapPlayer player, string path, CancellationToken ct, Action onDetach, Action onSuccess)
         {
-            await _hapNativeGate.WaitAsync(ct);
-            try
-            {
+            return await ExecuteNativeOpAsync(async () => {
                 await AsyncExtensions.RunOnMainThread(() => { onDetach?.Invoke(); if (player) player.targetTexture = null; }, ct);
-                await AsyncExtensions.WaitForEndOfFrame(ct);
-                await AsyncExtensions.WaitFrames(1, ct); // GPU Barrier
-
+                
                 if (player) {
                     await AsyncExtensions.RunOnMainThread(() => player.Close(), ct);
                     await AsyncExtensions.WaitFrames(nativeCleanupFrames, ct);
                 }
                 if (player) {
-                    await AsyncExtensions.RunOnMainThread(() => player.Open(path), ct);
-                    await AsyncExtensions.WaitFrames(nativeCleanupFrames, ct);
+                    await AsyncExtensions.RunOnMainThread(() => {
+                        player.Open(path);
+                        // FIX 5: Ensure component enabled after Open
+                        if (player) player.enabled = true; 
+                    }, ct);
+                    await AsyncExtensions.WaitFrames(2, ct); // Micro-cooldown (Fix 6)
                 }
-            }
-            finally { _hapNativeGate.Release(); }
+                
+                // Scope RT assignment inside gate (Fix 2 refinement)
+                if (onSuccess != null) await AsyncExtensions.RunOnMainThread(onSuccess, ct);
 
-            // Wait for Valid
-            var timeout = DateTime.UtcNow.AddSeconds(videoLoadTimeoutSeconds);
-            bool opened = false;
-            while (!opened && DateTime.UtcNow < timeout) {
-                ct.ThrowIfCancellationRequested();
-                opened = await AsyncExtensions.RunOnMainThread(() => player.isValid && player.streamDuration > 0.1f, ct);
-                if (!opened) await Task.Yield();
-            }
+                // Wait for Valid (inside gate to prevent races)
+                var timeout = DateTime.UtcNow.AddSeconds(videoLoadTimeoutSeconds);
+                bool opened = false;
+                while (!opened && DateTime.UtcNow < timeout) {
+                    if (ct.IsCancellationRequested) break;
+                    opened = await AsyncExtensions.RunOnMainThread(() => player.isValid && player.streamDuration > 0.1f, ct);
+                    if (!opened) await AsyncExtensions.WaitForEndOfFrame(ct);
+                }
 
-            if (!opened) return false;
+                if (!opened) return false;
 
-            // Apply texture setup
-            if (onSuccess != null) await AsyncExtensions.RunOnMainThread(onSuccess, ct);
+                // === STRICT START HANDSHAKE (Safe inside gate) ===
+                bool started = await EnsurePlaybackAdvancesAsync(player, Path.GetFileName(path), ct);
+                return started;
 
-            // === STRICT START HANDSHAKE ===
-            bool started = await EnsurePlaybackAdvancesAsync(player, Path.GetFileName(path), ct);
-            return started;
+            }, ct);
         }
 
         public async Task ReleaseVideoAsync(HapPlayer player, CancellationToken ct = default, Action onDetach = null)
@@ -289,30 +304,96 @@ namespace SomaticLandscapes.Async
 
                 try
                 {
-                    await AsyncExtensions.RunOnMainThread(() => { 
-                        onDetach?.Invoke(); 
-                        if (player) player.targetTexture = null; 
-                    }, ct);
-                    
-                    await AsyncExtensions.WaitForEndOfFrame(ct); 
-                    await AsyncExtensions.WaitFrames(1, ct);
+                    await ExecuteNativeOpAsync(async () => {
+                        await AsyncExtensions.RunOnMainThread(() => { 
+                            onDetach?.Invoke(); 
+                            if (player) player.targetTexture = null; 
+                        }, ct);
+                        
+                        // Wait for pipe clear
+                        await AsyncExtensions.WaitFrames(1, ct);
 
-                    await _hapNativeGate.WaitAsync(ct);
-                    try {
                         await AsyncExtensions.RunOnMainThread(() => player.Close(), ct);
-                    } finally { _hapNativeGate.Release(); }
-                    
-                    await AsyncExtensions.WaitFrames(nativeCleanupFrames, ct);
+                        await AsyncExtensions.WaitFrames(nativeCleanupFrames, ct);
+                    }, ct);
                 }
                 catch (Exception e) { LogWarning($"Release error: {e.Message}"); }
             }
             finally { playerLock.Release(); }
         }
 
+        /// <summary>
+        /// ProFix3: Global gate wrapper that pauses Spout/DXGI sharing during native operations
+        /// </summary>
+        /// <summary>
+        /// ProFix3: Global gate wrapper that pauses Spout/DXGI sharing during native operations
+        /// </summary>
+        private async Task<bool> ExecuteNativeOpAsync(Func<Task<bool>> op, CancellationToken ct) // Overload for methods returning bool
+        {
+             bool result = false;
+             await ExecuteNativeOpAsync(async () => { result = await op(); }, ct);
+             return result;
+        }
+
+        private async Task ExecuteNativeOpAsync(Func<Task> op, CancellationToken ct)
+        {
+            await _hapNativeGate.WaitAsync(ct);
+            bool spoutPaused = false;
+            SpoutSender sender = null;
+            try
+            {
+                // Pause Spout (SAFE PAUSE)
+                if (Instance)
+                {
+                    // Use new Paused property instead of enabling/disabling component
+                    // Safe MainThread lookup of SpoutSender
+                    await AsyncExtensions.RunOnMainThread(() => {
+                        sender = GetSpoutSender();
+                        if (sender) sender.Paused = true;
+                    }, ct);
+                    
+                    if (sender) 
+                    {
+                        spoutPaused = true;
+                        // Barrier BEFORE: Wait 2 frames to ensure GPU queue handles the pause
+                        await AsyncExtensions.WaitForEndOfFrame(ct);
+                        await AsyncExtensions.WaitForEndOfFrame(ct);
+                    }
+                }
+
+                // Execute Native Op
+                await op();
+
+                // Barrier AFTER: Wait before resuming
+                await AsyncExtensions.WaitForEndOfFrame(ct);
+                await AsyncExtensions.WaitForEndOfFrame(ct);
+
+                // Resume Spout
+                if (spoutPaused && sender)
+                {
+                    await AsyncExtensions.RunOnMainThread(() => { if (sender) sender.Paused = false; }, ct);
+                }
+            }
+            finally
+            {
+                // Crash safety: ensure Spout resumes if loop aborted
+                if (spoutPaused && sender)
+                {
+                    try {
+                         GlobalMainThreadDispatcher.Enqueue(() => { if (sender) sender.Paused = false; });
+                    } catch {}
+                }
+                _hapNativeGate.Release();
+            }
+        }
+
         public void ReleaseVideo(HapPlayer p) => _ = ReleaseVideoAsync(p, CancellationToken.None);
 
         public async Task<bool> LoadAndAssignVideoAsync(string fullPath, HapPlayer hp, int w, int h, string rtName, RenderTexture manualRT, UnityEngine.UI.RawImage targetImg, bool isLooping, CancellationToken ct, Action<RenderTexture> onRtAssigned = null)
         {
+             // LEAK FIX: Capture old RT reference before we potentially lose it/replace it
+             RenderTexture oldRT = (hp != null) ? hp.targetTexture : null;
+
              return await LoadVideoAsync(fullPath, hp, ct, 
                 () => { if (targetImg) targetImg.texture = null; }, 
                 () => {
@@ -320,6 +401,12 @@ namespace SomaticLandscapes.Async
                     RenderTexture rt = manualRT;
                     if (rt == null) rt = GetOrCreateRenderTexture(w, h, rtName);
                     
+                    // LEAK FIX: release the old texture back to pool if we are replacing it
+                    if (oldRT != null && oldRT != rt)
+                    {
+                         ReturnRenderTexture(oldRT);
+                    }
+
                     hp.targetTexture = rt;
                     if (targetImg) targetImg.texture = rt;
                     onRtAssigned?.Invoke(rt);

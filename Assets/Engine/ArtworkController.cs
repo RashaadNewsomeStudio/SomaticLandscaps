@@ -56,6 +56,7 @@ public class ArtworkController : MonoBehaviour
 
     [Header("BEHAVIOR")]
     public bool ignoreAmbientWhileActive = true; 
+    public bool activeClickCancelsToAmbient = false; // Mapped from JSON 
 
     // STARTUP
     [Header("STARTUP UI")]
@@ -164,7 +165,7 @@ public class ArtworkController : MonoBehaviour
         
         _startup = new StartupPanelsFlow(this);
 
-        _config.TryLoadAndApply();      
+        _config.TryLoadAndApply(true);      
         
         EnsureRTs();
         WirePlayersToRTs();
@@ -172,6 +173,11 @@ public class ArtworkController : MonoBehaviour
         if (idleGA)      idleGA.alpha = 0f;
         if (idleGB)      idleGB.alpha = 0f;
         if (activeGroup) activeGroup.alpha = 0f;
+
+        // FIX: Force hide startup panels by default. 
+        // If they are skipped by config, they must not be visible.
+        if (introPanel)  introPanel.SetActive(false);
+        if (adjustPanel) adjustPanel.SetActive(false);
 
         _media.AutoPopulateIfNeeded();  
         Application.runInBackground = true;
@@ -192,6 +198,10 @@ public class ArtworkController : MonoBehaviour
             
             ControllerMain.LogStep("ArtworkController Start logic beginning...");
             await InitializeAndStartAsync(_cts.Token);
+        }
+        catch (OperationCanceledException)
+        {
+            ControllerMain.LogInfo("ArtworkController startup cancelled (likely shutdown).");
         }
         catch (Exception ex)
         {
@@ -215,6 +225,9 @@ public class ArtworkController : MonoBehaviour
 
     private async Task InitializeAndStartAsync(CancellationToken ct)
     {
+        // FIX: Ensure config is loaded after ControllerMain is definitely ready (solves execution order race)
+        _config.TryLoadAndApply(true);
+        
         SanityCheckIds();
         
         ControllerMain.LogStep("Step 1: Discovering Media...");
