@@ -2,7 +2,7 @@
 
 **Unity Source Project for Rashaad Newsome Studio (California / New York)**
 
-A production-hardened, async-first video installation system designed for 24/7 museum deployment. Features HAP-Q GPU-accelerated playback, museum-grade stability mechanisms, and OSC control integration.
+A production-hardened, video installation system designed for 24/7 museum deployment. Features HAP-Q GPU-accelerated playback, museum-grade stability mechanisms, and OSC control integration.
 
 ---
 
@@ -99,8 +99,8 @@ Somatic Landscapes/
 
 ```json
 {
-  "ResolutionWidth": 3840,
-  "ResolutionHeight": 2160,
+  "ResolutionWidth": 5280,
+  "ResolutionHeight": 1620,
   
   // === STABILITY SETTINGS ===
   "CrossfadeIdle": false,           // Single-decoder mode (reduces GPU pressure)
@@ -127,7 +127,8 @@ Somatic Landscapes/
   "AutoLoadMusicFromStreaming": true,
   
   // === UI ===
-  "EnableStartupPanels": false      // Skip intro for museum deployment
+  "EnableStartupPanels": false,      // Skip intro for museum deployment
+  "OscBlockReturnToIdle": true
 }
 ```
 
