@@ -348,5 +348,3 @@ For deployment assistance or technical questions:
 - Review configuration in `Config/ArtworkConfig.json`
 
 ---
-
-**Museum-Grade. Production-Ready. Zero-Compromise Stability.**
